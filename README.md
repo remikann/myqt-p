@@ -1,7 +1,7 @@
 # QTNet
 ## [NeurIPS 2023] **Q**uery-based **T**emporal Fusion with Explicit Motion for 3D Object Detection
 [![paper](https://img.shields.io/badge/OpenReview-Paper-<COLOR>.svg)](https://openreview.net/pdf?id=gySmwdmVDF)
-
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/remikann/myqt-p)
 ## Introduction
 This repository is an official implementation of QTNet.
 
