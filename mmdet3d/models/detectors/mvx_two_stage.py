@@ -75,7 +75,8 @@ class MVXTwoStageDetector(Base3DDetector):
 
     def init_weights(self, pretrained=None):
         """Initialize model weights."""
-        super(MVXTwoStageDetector, self).init_weights(pretrained)
+        super(MVXTwoStageDetector, self).init_weights()
+        # super(MVXTwoStageDetector, self).init_weights(pretrained)
         if pretrained is None:
             img_pretrained = None
             pts_pretrained = None
@@ -86,9 +87,11 @@ class MVXTwoStageDetector(Base3DDetector):
             raise ValueError(
                 f'pretrained should be a dict, got {type(pretrained)}')
         if self.with_img_backbone:
-            self.img_backbone.init_weights(pretrained=img_pretrained)
+            # self.img_backbone.init_weights(pretrained=img_pretrained)
+            self.img_backbone.init_weights()
         if self.with_pts_backbone:
             self.pts_backbone.init_weights(pretrained=pts_pretrained)
+            # self.pts_backbone.init_weights()
         if self.with_img_neck:
             if isinstance(self.img_neck, nn.Sequential):
                 for m in self.img_neck:
@@ -98,6 +101,7 @@ class MVXTwoStageDetector(Base3DDetector):
 
         if self.with_img_roi_head:
             self.img_roi_head.init_weights(img_pretrained)
+            # self.img_roi_head.init_weights()
         if self.with_img_rpn:
             self.img_rpn_head.init_weights()
         if self.with_pts_bbox:

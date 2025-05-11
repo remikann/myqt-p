@@ -1,5 +1,5 @@
 import pickle
-
+import os
 import mmcv
 import numpy as np
 
@@ -541,15 +541,22 @@ class LoadPointsFromMultiSweeps(object):
         """
         if self.file_client is None:
             self.file_client = mmcv.FileClient(**self.file_client_args)
+        
+        # 手动拼接路径    
+        if pts_filename.startswith('nuscenes_gt_database/'):
+            full_path = os.path.join("/wangjinhai1/zYu/QTNet/data/nuscenes", pts_filename)
+        else:
+            full_path = pts_filename
         try:
-            pts_bytes = self.file_client.get(pts_filename)
+            # pts_bytes = self.file_client.get(pts_filename)
+            pts_bytes = self.file_client.get(full_path)
             points = np.frombuffer(pts_bytes, dtype=np.float32)
         except ConnectionError:
-            mmcv.check_file_exist(pts_filename)
+            mmcv.check_file_exist(full_path)
             if pts_filename.endswith('.npy'):
-                points = np.load(pts_filename)
+                points = np.load(full_path)
             else:
-                points = np.fromfile(pts_filename, dtype=np.float32)
+                points = np.fromfile(full_path, dtype=np.float32)
         return points
 
     def _remove_close(self, points, radius=1.0):
@@ -766,15 +773,22 @@ class LoadPointsFromFile(object):
         """
         if self.file_client is None:
             self.file_client = mmcv.FileClient(**self.file_client_args)
+           
+        # 手动拼接路径
+        if pts_filename.startswith('nuscenes_gt_database/'):
+            full_path = os.path.join("/wangjinhai1/zYu/QTNet/data/nuscenes", pts_filename)
+        else:
+            full_path = pts_filename
+            
         try:
-            pts_bytes = self.file_client.get(pts_filename)
+            pts_bytes = self.file_client.get(full_path)
             points = np.frombuffer(pts_bytes, dtype=np.float32)
         except ConnectionError:
-            mmcv.check_file_exist(pts_filename)
+            mmcv.check_file_exist(full_path)
             if pts_filename.endswith('.npy'):
-                points = np.load(pts_filename)
+                points = np.load(full_path)
             else:
-                points = np.fromfile(pts_filename, dtype=np.float32)
+                points = np.fromfile(full_path, dtype=np.float32)
 
         return points
 

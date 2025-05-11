@@ -1,8 +1,29 @@
 import warnings
 
 from mmdet.models.builder import (BACKBONES, DETECTORS, HEADS, LOSSES, NECKS,
-                                  ROI_EXTRACTORS, SHARED_HEADS, build)
+                                  ROI_EXTRACTORS, SHARED_HEADS)
 from .registry import FUSION_LAYERS, MIDDLE_ENCODERS, VOXEL_ENCODERS
+
+from mmcv.utils import Registry, build_from_cfg
+
+def build(cfg, registry, default_args=None):
+    """Build a module.
+    Args:
+        cfg (dict, list[dict]): The config of modules, is is either a dict
+            or a list of configs.
+        registry (:obj:`Registry`): A registry the module belongs to.
+        default_args (dict, optional): Default arguments to build the module.
+            Defaults to None.
+    Returns:
+        nn.Module: A built nn module.
+    """
+    if isinstance(cfg, list): # isinstance() 函数来判断一个对象是否是一个已知的类型，类似 type()。
+        modules = [
+            build_from_cfg(cfg_, registry, default_args) for cfg_ in cfg # build_from_cfg()在后面进行讲解。
+        ]
+        return nn.Sequential(*modules) # nn.Sequential(*modules)
+    else:
+        return build_from_cfg(cfg, registry, default_args)
 
 
 def build_backbone(cfg):

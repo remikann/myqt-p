@@ -178,11 +178,11 @@ def waymo_data_prep(root_path,
 
 
 parser = argparse.ArgumentParser(description='Data converter arg parser')
-parser.add_argument('dataset', metavar='kitti', help='name of the dataset')
+parser.add_argument('--dataset', metavar='kitti', help='name of the dataset')
 parser.add_argument(
     '--root-path',
     type=str,
-    default='./data/kitti',
+    default='./data/nuscenes',
     help='specify the root path of dataset')
 parser.add_argument(
     '--version',
@@ -199,10 +199,10 @@ parser.add_argument(
 parser.add_argument(
     '--out-dir',
     type=str,
-    default='./data/kitti',
+    default='./data/nuscenes',
     required='False',
     help='name of info pkl')
-parser.add_argument('--extra-tag', type=str, default='kitti')
+parser.add_argument('--extra-tag', type=str, default='nuscenes')
 parser.add_argument(
     '--workers', type=int, default=4, help='number of threads to be used')
 args = parser.parse_args()

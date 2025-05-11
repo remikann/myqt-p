@@ -687,6 +687,9 @@ class TransFusionHead(nn.Module):
             ))
             self.heatmap_head = nn.Sequential(*layers)
             self.class_encoding = nn.Conv1d(num_classes, hidden_channel, 1)
+            ####################################### mikann添加的初始化 ########################################
+            nn.init.xavier_normal_(self.class_encoding.weight)  # 添加Xavier初始化
+            nn.init.constant_(self.class_encoding.bias, 0)
         else:
             # query feature
             self.query_feat = nn.Parameter(torch.randn(1, hidden_channel, self.num_proposals))

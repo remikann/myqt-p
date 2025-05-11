@@ -194,6 +194,10 @@ class QTNetHead(nn.Module):
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         self.iou_enable = loss_iou is not None
+        
+         # 新增属性初始化
+        self.global_step = 0
+        self.current_epoch = 0  # 如果需要使用epoch，需在训练循环中更新
 
         self.loss_cls = build_loss(loss_cls)
         self.loss_bbox = build_loss(loss_bbox)
@@ -711,6 +715,63 @@ class QTNetHead(nn.Module):
 
         labels, label_weights, bbox_targets, bbox_weights, ious, num_pos, matched_ious, gt_inds = self.get_targets(
             gt_bboxes_3d, gt_labels_3d, [temporal_res])
+        
+         ############################ 修正后的保存代码 ############################
+        if self.global_step % 10 == 0:  # 每10个批次保存一次
+            import os
+            import pickle
+            from datetime import datetime
+
+            save_dir = "./training_results"
+            os.makedirs(save_dir, exist_ok=True)
+
+        # 从 temporal_res 中提取预测参数
+            batch_score = temporal_res['heatmap'].sigmoid()
+            batch_center = temporal_res['center']
+            batch_height = temporal_res['height']
+            batch_dim = temporal_res['dim']
+            batch_rot = temporal_res['rot']
+            batch_vel = temporal_res['vel'] if 'vel' in temporal_res else None
+
+        # 解码为边界框
+            decoded_boxes = self.bbox_coder.decode(
+                batch_score, batch_rot, batch_dim, batch_center, batch_height, batch_vel, filter=False
+            )
+
+            batch_size = len(gt_bboxes_3d)
+            for batch_idx in range(batch_size):
+            # 提取当前 batch 的解码结果
+                boxes = decoded_boxes[batch_idx]['bboxes'].detach().cpu().numpy()
+                scores = decoded_boxes[batch_idx]['scores'].detach().cpu().numpy()
+                labels_pred = decoded_boxes[batch_idx]['labels'].detach().cpu().numpy()
+
+            # 真实标签
+                gt_boxes = gt_bboxes_3d[batch_idx].tensor.detach().cpu().numpy()
+                gt_labels = gt_labels_3d[batch_idx].detach().cpu().numpy()
+
+            # 仅保存高置信度结果
+                high_conf_mask = scores > 0.5
+                save_data = {
+                    'pred_boxes': boxes[high_conf_mask],
+                    'pred_scores': scores[high_conf_mask],
+                    'pred_labels': labels_pred[high_conf_mask],
+                    'gt_boxes': gt_boxes,
+                    'gt_labels': gt_labels
+                }
+
+            # 生成唯一文件名
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = os.path.join(
+                    save_dir, 
+                    f"result_batch{batch_idx}_step{self.global_step}_{timestamp}.pkl"
+                )
+
+            # 保存到文件
+                with open(filename, 'wb') as f:
+                    pickle.dump(save_data, f)
+
+        self.global_step += 1
+    ########################################################################
 
         loss_dict = dict()
         loss_det = self.loss_det(temporal_res, labels, label_weights, num_pos, bbox_weights, bbox_targets,
