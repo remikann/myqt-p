@@ -268,7 +268,7 @@ log_config = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = None
-load_from = '/wangjinhai1/zYu/QTNet/checkpoint/epoch_20.pth'
+load_from = '/wangjinhai1/zYu/QTNet/checkpoint/epoch_11_lc_0c20l_cyclicwarmup_cflt.pth'
 # load_from = None
 resume_from = None
 workflow = [('train', 1)]

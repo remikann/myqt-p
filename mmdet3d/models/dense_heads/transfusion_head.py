@@ -867,7 +867,25 @@ class TransFusionHead(nn.Module):
             top_proposals_index = top_proposals % heatmap.shape[-1]
             query_feat = lidar_feat_flatten.gather(index=top_proposals_index[:, None, :].expand(-1, lidar_feat_flatten.shape[1], -1), dim=-1)
             self.query_labels = top_proposals_class
-
+            
+            #--------------------------------------------------------------------------------------------
+            # 在此处添加保存query_feat的代码  
+            # 获取当前样本的文件名  
+            name = img_metas[0]['pts_filename'].split('/')[-1].split('.')[0] + '.bin'
+            # 确定保存路径（根据是否为测试模式）  
+            memory_bank_root = self.test_cfg.get('memory_bank_root', 'data/nuscenes/memorybank1/transfusionL/')  
+            if self.training:  
+                out_path = memory_bank_root + 'queries/train/'   
+            else:  
+                out_path = memory_bank_root + 'queries/val/'
+            # 确保目录存在  
+            import os  
+            os.makedirs(out_path, exist_ok=True)  
+            # 保存查询特征为npy文件  
+            query_feat_np = query_feat.detach().cpu().numpy()  
+            np.save(out_path + name, query_feat_np)
+            #--------------------------------------------------------------------------------------------
+            
             # add category embedding
             one_hot = F.one_hot(top_proposals_class, num_classes=self.num_classes).permute(0, 2, 1)
             query_cat_encoding = self.class_encoding(one_hot.float())
@@ -1369,6 +1387,8 @@ class TransFusionHead(nn.Module):
                     ret = dict(bboxes=boxes3d, scores=scores, labels=labels)
                 ret_layer.append(ret)
             rets.append(ret_layer)
+        #m len print
+        print(f"rets shape: {len(rets)}, rets[0] shape: {len(rets[0])}")
         assert len(rets) == 1
         assert len(rets[0]) == 1
         res = [[

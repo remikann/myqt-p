@@ -265,4 +265,5 @@ work_dir = None
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
-gpu_ids = [1,2,4,5,6,7]
+gpu_ids = [0,1,2,3,4,5,6,7]
+memory_bank_root = 'data/nuscenes/memorybank1/transfusionL/'

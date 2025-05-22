@@ -8,7 +8,7 @@ out_size_factor = 8
 num_frames = 4
 dataset_type = 'NuScenesDatasetMemory'
 data_root = 'data/nuscenes/'
-root_dir = data_root + 'memorybank/'
+root_dir = data_root + 'memorybank1/'
 features_root_train = root_dir + 'transfusionL/queries/train/'
 features_root_val = root_dir + 'transfusionL/queries/val/'
 features_root_test = root_dir + 'transfusionL/queries/test/'
@@ -156,7 +156,7 @@ momentum_config = dict(
     target_ratio=(0.8947368421052632, 1),
     cyclic_times=1,
     step_ratio_up=0.4)
-total_epochs = 10
+total_epochs = 20
 evaluation = dict(interval=10)
 checkpoint_config = dict(interval=1)
 log_config = dict(

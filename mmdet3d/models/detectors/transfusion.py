@@ -150,6 +150,30 @@ class TransFusionDetector(MVXTwoStageDetector):
                 gt_bboxes_ignore=gt_bboxes_ignore,
                 proposals=proposals)
             losses.update(losses_img)
+        #--------------------------------------------------------------------------------------        
+        # 以下是新增代码 - 在训练过程中保存检测结果
+        # 在返回losses之前插入以下代码
+
+        if self.training:  
+            with torch.no_grad():  
+                # 逐个样本处理，避免批处理导致的断言错误  
+                batch_size = len(img_metas)  
+                for i in range(batch_size):  
+                    # 创建只包含单个样本的输入  
+                    single_points = [points[0][i:i+1]]  # 假设points是列表的列表  
+                    single_img = [img[i:i+1]] if img is not None else None  
+                    single_img_metas = [img_metas[i]]  # 只取一个样本的元数据  
+                   # 保存当前模式  
+                    training_mode = self.training  
+      
+                    # 临时切换到评估模式  
+                    self.eval()  
+                    # 调用simple_test处理单个样本  
+                    _ = self.simple_test(single_points, single_img_metas, single_img,datrain=1) 
+                    # 恢复原来的模式  
+                    if training_mode:  
+                        self.train()
+        #--------------------------------------------------------------------------------------  
         return losses
 
     def forward_pts_train(self,
@@ -176,10 +200,11 @@ class TransFusionDetector(MVXTwoStageDetector):
         """
         outs = self.pts_bbox_head(pts_feats, img_feats, img_metas)
         loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
-        losses = self.pts_bbox_head.loss(*loss_inputs)
+        losses = self.pts_bbox_head.loss(*loss_inputs)  
+        
         return losses
 
-    def simple_test_pts(self, x, x_img, img_metas, rescale=False):
+    def simple_test_pts(self, x, x_img, img_metas, rescale=False,datrain=0):
         """Test function of point cloud branch."""
         outs = self.pts_bbox_head(x, x_img, img_metas)
         bbox_list = self.pts_bbox_head.get_bboxes(
@@ -188,9 +213,34 @@ class TransFusionDetector(MVXTwoStageDetector):
             bbox3d2result(bboxes, scores, labels)
             for bboxes, scores, labels in bbox_list
         ]
+        #---------------------------------------------------------------------------------------------------
+        # 在此处添加保存检测结果的代码  
+        import numpy as np  
+        import pickle  
+        import os  
+        for i, (bboxes, scores, labels) in enumerate(bbox_list):  
+            # 获取当前样本的文件名  
+            name = img_metas[i]['pts_filename'].split('/')[-1].split('.')[0] + '.bin'  
+            # 提取检测结果  
+            boxes = bboxes.tensor.cpu().numpy()  
+            scores_np = scores.cpu().numpy()  
+            labels_np = labels.cpu().numpy()  
+            result = dict(boxes=boxes, scores=scores_np, labels=labels_np)  
+            # 确定保存路径（根据是否为测试模式）  
+            memory_bank_root = self.test_cfg.get('memory_bank_root', 'data/nuscenes/memorybank1/transfusionL/')  
+            if datrain==1:  
+                out_path_det = memory_bank_root + 'detections/train/' 
+            else:  
+                out_path_det = memory_bank_root + 'detections/val/'
+            # 确保目录存在  
+            os.makedirs(out_path_det, exist_ok=True)  
+            # 保存检测结果为bin文件  
+            pickle.dump(result, open(out_path_det + name, 'wb'))
+        #-----------------------------------------------------------------------------------------------------------
+        
         return bbox_results
 
-    def simple_test(self, points, img_metas, img=None, rescale=False):
+    def simple_test(self, points, img_metas, img=None, rescale=False,datrain=0):
         """Test function without augmentaiton."""
         img_feats, pts_feats = self.extract_feat(
             points, img=img, img_metas=img_metas)
@@ -198,7 +248,7 @@ class TransFusionDetector(MVXTwoStageDetector):
         bbox_list = [dict() for i in range(len(img_metas))]
         if pts_feats and self.with_pts_bbox:
             bbox_pts = self.simple_test_pts(
-                pts_feats, img_feats, img_metas, rescale=rescale)
+                pts_feats, img_feats, img_metas, rescale=rescale,datrain=datrain)
             for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
                 result_dict['pts_bbox'] = pts_bbox
         if img_feats and self.with_img_bbox:
