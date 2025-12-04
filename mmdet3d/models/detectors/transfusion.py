@@ -40,6 +40,17 @@ class TransFusionDetector(MVXTwoStageDetector):
     def extract_img_feat(self, img, img_metas):
         """Extract features of images."""
         if self.with_img_backbone and img is not None:
+                # ---- 新增：统一 img_metas 的格式 ----
+            # 训练时是 List[Dict]，但是在 forward_test / simple_test 里
+            # 会传进来一个 Dict（来自 img_metas[0]），这里统一成 List[Dict]，
+            # 防止后面 for 循环迭代到的是字符串 key。
+            if isinstance(img_metas, dict):
+                img_metas = [img_metas]
+            elif isinstance(img_metas, (list, tuple)) and len(img_metas) > 0 \
+                    and isinstance(img_metas[0], (list, tuple)):
+                # 兼容偶尔会出现的 [[meta]] 这种嵌套一层的情况
+                img_metas = img_metas[0]
+                # ---- 新增结束 ----
             input_shape = img.shape[-2:]
             # update real input shape of each single img
             for img_meta in img_metas:
@@ -74,29 +85,41 @@ class TransFusionDetector(MVXTwoStageDetector):
     @torch.no_grad()
     @force_fp32()
     def voxelize(self, points):
-        """Apply dynamic voxelization to points.
+            """Accept Tensor (N,C) or List[Tensor]; return concatenated tensors.
+            Returns:
+                voxels:      (M, max_points, C)  float
+                num_points:  (M,)               int
+                coors:       (M, 4)             long  [batch_idx, z, y, x]
+            """
+            if isinstance(points, torch.Tensor):
+                points = [points]
+            elif not isinstance(points, (list, tuple)):
+                if hasattr(points, 'tensor'):
+                    points = [points.tensor]
+                else:
+                    points = [points]
 
-        Args:
-            points (list[torch.Tensor]): Points of each sample.
+            voxels_list, num_points_list, coors_list = [], [], []
 
-        Returns:
-            tuple[torch.Tensor]: Concatenated points, number of points
-                per voxel, and coordinates.
-        """
-        voxels, coors, num_points = [], [], []
-        for res in points:
-            res_voxels, res_coors, res_num_points = self.pts_voxel_layer(res)
-            voxels.append(res_voxels)
-            coors.append(res_coors)
-            num_points.append(res_num_points)
-        voxels = torch.cat(voxels, dim=0)
-        num_points = torch.cat(num_points, dim=0)
-        coors_batch = []
-        for i, coor in enumerate(coors):
-            coor_pad = F.pad(coor, (1, 0), mode='constant', value=i)
-            coors_batch.append(coor_pad)
-        coors_batch = torch.cat(coors_batch, dim=0)
-        return voxels, num_points, coors_batch
+            # -------- 新增：对每个样本做最多 N 点的随机下采样（例如 300k）--------
+            POINT_CAP = 200000
+            for i, res in enumerate(points):
+                if res.shape[0] > POINT_CAP:
+                    idx = torch.randint(0, res.shape[0], (POINT_CAP,), device=res.device)
+                    res = res.index_select(0, idx)
+                # --------------------------------------------------------------
+
+                v, c, n = self.pts_voxel_layer(res)  # v:(m,T,C) c:(m,3) n:(m,)
+                voxels_list.append(v); num_points_list.append(n); coors_list.append(c)
+
+            voxels = torch.cat(voxels_list, dim=0)
+            num_points = torch.cat(num_points_list, dim=0)
+            coors_w_batch = []
+            for i, coor in enumerate(coors_list):
+                b = torch.full((coor.shape[0], 1), i, dtype=coor.dtype, device=coor.device)
+                coors_w_batch.append(torch.cat([b, coor], dim=1))
+            coors = torch.cat(coors_w_batch, dim=0)
+            return voxels, num_points, coors
 
     def forward_train(self,
                       points=None,
@@ -107,7 +130,9 @@ class TransFusionDetector(MVXTwoStageDetector):
                       gt_bboxes=None,
                       img=None,
                       proposals=None,
-                      gt_bboxes_ignore=None):
+                      gt_bboxes_ignore=None,
+                      gt_vis_labels=None,           # ← 新增
+                      gt_cause_labels=None):
         """Forward training function.
 
         Args:
@@ -139,7 +164,8 @@ class TransFusionDetector(MVXTwoStageDetector):
         if pts_feats:
             losses_pts = self.forward_pts_train(pts_feats, img_feats, gt_bboxes_3d,
                                                 gt_labels_3d, img_metas,
-                                                gt_bboxes_ignore)
+                                                gt_bboxes_ignore,
+                                                gt_vis_labels=gt_vis_labels,gt_cause_labels=gt_cause_labels)
             losses.update(losses_pts)
         if img_feats:
             losses_img = self.forward_img_train(
@@ -151,28 +177,7 @@ class TransFusionDetector(MVXTwoStageDetector):
                 proposals=proposals)
             losses.update(losses_img)
         #--------------------------------------------------------------------------------------        
-        # 以下是新增代码 - 在训练过程中保存检测结果
-        # 在返回losses之前插入以下代码
-
-        if self.training:  
-            with torch.no_grad():  
-                # 逐个样本处理，避免批处理导致的断言错误  
-                batch_size = len(img_metas)  
-                for i in range(batch_size):  
-                    # 创建只包含单个样本的输入  
-                    single_points = [points[0][i:i+1]]  # 假设points是列表的列表  
-                    single_img = [img[i:i+1]] if img is not None else None  
-                    single_img_metas = [img_metas[i]]  # 只取一个样本的元数据  
-                   # 保存当前模式  
-                    training_mode = self.training  
-      
-                    # 临时切换到评估模式  
-                    self.eval()  
-                    # 调用simple_test处理单个样本  
-                    _ = self.simple_test(single_points, single_img_metas, single_img,datrain=1) 
-                    # 恢复原来的模式  
-                    if training_mode:  
-                        self.train()
+        
         #--------------------------------------------------------------------------------------  
         return losses
 
@@ -182,7 +187,8 @@ class TransFusionDetector(MVXTwoStageDetector):
                           gt_bboxes_3d,
                           gt_labels_3d,
                           img_metas,
-                          gt_bboxes_ignore=None):
+                          gt_bboxes_ignore=None,
+                          gt_vis_labels=None, gt_cause_labels=None):
         """Forward function for point cloud branch.
 
         Args:
@@ -199,61 +205,102 @@ class TransFusionDetector(MVXTwoStageDetector):
             dict: Losses of each branch.
         """
         outs = self.pts_bbox_head(pts_feats, img_feats, img_metas)
-        loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
-        losses = self.pts_bbox_head.loss(*loss_inputs)  
-        
+        # loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
+        # losses = self.pts_bbox_head.loss(*loss_inputs)  
+        losses = self.pts_bbox_head.loss(
+            gt_bboxes_3d, gt_labels_3d, outs,
+            gt_vis_labels_list=gt_vis_labels,             # ← 新增
+            gt_cause_labels_list=gt_cause_labels,         # ← 新增
+            img_metas=img_metas)
         return losses
 
-    def simple_test_pts(self, x, x_img, img_metas, rescale=False,datrain=0):
-        """Test function of point cloud branch."""
+    # transfusion.py
+    def simple_test_pts(self, x, x_img, img_metas, rescale=False, datrain=0):
+        """Return list of length B; each item is a dict:
+           {
+             'boxes_3d': ...,
+             'scores_3d': ...,
+             'labels_3d': ...,
+             'attrs': {'vis': ..., 'cause': ...}  # 可选
+           }
+        """
+
         outs = self.pts_bbox_head(x, x_img, img_metas)
         bbox_list = self.pts_bbox_head.get_bboxes(
-            outs, img_metas, rescale=rescale)
-        bbox_results = [
-            bbox3d2result(bboxes, scores, labels)
-            for bboxes, scores, labels in bbox_list
-        ]
-        #---------------------------------------------------------------------------------------------------
-        # 在此处添加保存检测结果的代码  
-        import numpy as np  
-        import pickle  
-        import os  
-        for i, (bboxes, scores, labels) in enumerate(bbox_list):  
-            # 获取当前样本的文件名  
-            name = img_metas[i]['pts_filename'].split('/')[-1].split('.')[0] + '.bin'  
-            # 提取检测结果  
-            boxes = bboxes.tensor.cpu().numpy()  
-            scores_np = scores.cpu().numpy()  
-            labels_np = labels.cpu().numpy()  
-            result = dict(boxes=boxes, scores=scores_np, labels=labels_np)  
-            # 确定保存路径（根据是否为测试模式）  
-            memory_bank_root = self.test_cfg.get('memory_bank_root', 'data/nuscenes/memorybank1/transfusionL/')  
-            if datrain==1:  
-                out_path_det = memory_bank_root + 'detections/train/' 
-            else:  
-                out_path_det = memory_bank_root + 'detections/val/'
-            # 确保目录存在  
-            os.makedirs(out_path_det, exist_ok=True)  
-            # 保存检测结果为bin文件  
-            pickle.dump(result, open(out_path_det + name, 'wb'))
-        #-----------------------------------------------------------------------------------------------------------
-        
+            outs, img_metas, rescale=rescale
+        )
+
+        bbox_results = []
+        for out in bbox_list:
+            boxes_3d  = out['boxes_3d']
+            scores_3d = out['scores_3d']
+            labels_3d = out['labels_3d']
+
+            res = dict(
+                boxes_3d=boxes_3d,
+                scores_3d=scores_3d,
+                labels_3d=labels_3d,
+            )
+
+            # ★ 把辅助属性打包成 attrs，后面 evaluate 会按这个约定读取
+            attrs = {}
+            if out.get('attr_vis', None) is not None:
+                attrs['vis'] = out['attr_vis']
+            if out.get('attr_cause', None) is not None:
+                attrs['cause'] = out['attr_cause']
+            if len(attrs) > 0:
+                res['attrs'] = attrs
+
+            bbox_results.append(res)
+
         return bbox_results
 
-    def simple_test(self, points, img_metas, img=None, rescale=False,datrain=0):
-        """Test function without augmentaiton."""
+
+    def simple_test(self, points, img_metas, img=None, rescale=False, datrain=0):
+        """Return list[ dict(pts_bbox=...) ] of length B."""
+        # ---- 新增：统一 img_metas 的格式 ----
+        # 训练时是 List[Dict]，forward_test 里传进来的则是单个 Dict（img_metas[0]）。
+        # 这里统一成 List[Dict]，以便后续 pts_bbox_head 和 head.forward_single
+        # 一律按 List[Dict] 使用。
+        if isinstance(img_metas, dict):
+            # 来自 Base3DDetector.forward_test: img_metas[0]
+            img_metas = [img_metas]
+        elif isinstance(img_metas, (list, tuple)) and len(img_metas) > 0 \
+                and isinstance(img_metas[0], (list, tuple)):
+            # 兼容 [[meta]] 这种嵌套一层的情况
+            img_metas = img_metas[0]
+        # ---- 新增结束 ----
         img_feats, pts_feats = self.extract_feat(
             points, img=img, img_metas=img_metas)
 
-        bbox_list = [dict() for i in range(len(img_metas))]
-        if pts_feats and self.with_pts_bbox:
+        has_pts = pts_feats is not None and len(pts_feats) > 0
+
+        results = []
+        if has_pts:
             bbox_pts = self.simple_test_pts(
-                pts_feats, img_feats, img_metas, rescale=rescale,datrain=datrain)
-            for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
-                result_dict['pts_bbox'] = pts_bbox
-        if img_feats and self.with_img_bbox:
-            bbox_img = self.simple_test_img(
-                img_feats, img_metas, rescale=rescale)
-            for result_dict, img_bbox in zip(bbox_list, bbox_img):
-                result_dict['img_bbox'] = img_bbox
-        return bbox_list
+                pts_feats, img_feats, img_metas,
+                rescale=rescale, datrain=datrain)
+
+            # 现在 bbox_pts 是 list[dict]，每个 dict 已经包含 boxes_3d/scores_3d/labels_3d/attrs
+            for res in bbox_pts:
+                results.append({'pts_bbox': res})
+
+        else:
+            # 理论上不会走到；兜底返回空预测，但保持 batch 对齐
+            B = len(points) if isinstance(points, (list, tuple)) else 1
+            box_type_3d = img_metas[0]['box_type_3d']
+            device = points[0].device if isinstance(points, (list, tuple)) else points.device
+            for _ in range(B):
+                empty_boxes = box_type_3d(
+                    torch.zeros((0, 7), device=device),
+                    box_dim=7
+                )
+                results.append({
+                    'pts_bbox': dict(
+                        boxes_3d=empty_boxes,
+                        scores_3d=torch.empty(0, device=device),
+                        labels_3d=torch.empty(0, dtype=torch.long, device=device),
+                    )
+                })
+
+        return results

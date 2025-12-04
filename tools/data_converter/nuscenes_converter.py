@@ -20,56 +20,69 @@ def create_nuscenes_infos(root_path,
                           info_prefix,
                           version='v1.0-trainval',
                           max_sweeps=10):
-    """Create info file of nuscene dataset.
-
-    Given the raw data, generate its related info file in pkl format.
-
-    Args:
-        root_path (str): Path of the data root.
-        info_prefix (str): Prefix of the info file to be generated.
-        version (str): Version of the data.
-            Default: 'v1.0-trainval'
-        max_sweeps (int): Max number of sweeps.
-            Default: 10
-    """
+    """Create info file of nuscene dataset."""
     from nuscenes.nuscenes import NuScenes
-    nusc = NuScenes(version=version, dataroot=root_path, verbose=True)
     from nuscenes.utils import splits
-    available_vers = ['v1.0-trainval', 'v1.0-test', 'v1.0-mini']
-    assert version in available_vers
-    if version == 'v1.0-trainval':
-        train_scenes = splits.train
-        val_scenes = splits.val
-    elif version == 'v1.0-test':
-        train_scenes = splits.test
-        val_scenes = []
-    elif version == 'v1.0-mini':
-        train_scenes = splits.mini_train
-        val_scenes = splits.mini_val
-    else:
-        raise ValueError('unknown')
 
-    # filter existing scenes.
+    nusc = NuScenes(version=version, dataroot=root_path, verbose=True)
+    # 放在 create_nuscenes_infos() 里，new NuScenes() 之后即可拿到 nusc.visibility / nusc.attribute
+    vis_name_to_idx = {'v0-40': 0, 'v40-60': 1, 'v60-80': 2, 'v80-100': 3}
+    vis_tok_to_idx  = {v['token']: vis_name_to_idx.get(v['name'], -1)
+                    for v in nusc.visibility}
+
+    cause_name_to_idx = {'none':0, 'grape':1, 'self_fruit':2, 'leaf':3, 'vine':4, 'unknown':5}
+    cause_tok_to_idx  = {}
+    for a in nusc.attribute:
+        name = a['name']  # 形如 "occlusion_cause:leaf"
+        if name.startswith('occlusion_cause:'):
+            cause = name.split(':',1)[1]
+            if cause in cause_name_to_idx:
+                cause_tok_to_idx[a['token']] = cause_name_to_idx[cause]
+    ######################################################################
+    
+    # available_vers = ['v1.0-trainval', 'v1.0-test', 'v1.0-mini']
+    allow_prefix = ('v1.0-trainval', 'v1.0-test', 'v1.0-mini', 'v1.0-custom')
+    assert any(version.startswith(p) for p in allow_prefix)
+
+    # 先收集“实际存在”的场景，并建立 name->token 映射
     available_scenes = get_available_scenes(nusc)
-    available_scene_names = [s['name'] for s in available_scenes]
-    train_scenes = list(
-        filter(lambda x: x in available_scene_names, train_scenes))
-    val_scenes = list(filter(lambda x: x in available_scene_names, val_scenes))
-    train_scenes = set([
-        available_scenes[available_scene_names.index(s)]['token']
-        for s in train_scenes
-    ])
-    val_scenes = set([
-        available_scenes[available_scene_names.index(s)]['token']
-        for s in val_scenes
-    ])
+    name2token = {s['name']: s['token'] for s in available_scenes}
+    available_scene_names = list(name2token.keys())
 
-    test = 'test' in version
+    test = ('test' in version)
+
+    if version == 'v1.0-trainval':
+        train_names = [x for x in splits.train if x in available_scene_names]
+        val_names   = [x for x in splits.val   if x in available_scene_names]
+        # 官方名字全不匹配时，用 80/20 的自定义划分
+        if len(train_names) == 0 and len(val_names) == 0:
+            all_names = sorted(available_scene_names)
+            k_val = max(1, int(0.2 * len(all_names)))
+            train_names, val_names = all_names[:-k_val], all_names[-k_val:]
+    elif version == 'v1.0-mini':
+        train_names = [x for x in splits.mini_train if x in available_scene_names]
+        val_names   = [x for x in splits.mini_val   if x in available_scene_names]
+    elif version == 'v1.0-custom':
+        all_scenes = [s['name'] for s in nusc.scene]
+        # 8:2 划分（只有 1 个 scene 就全部给 train）
+        k = max(1, int(round(len(all_scenes) * 0.8)))
+        train_names = all_scenes[:k]
+        val_names = all_scenes[k:]
+    else:  # v1.0-test
+        test_names = [x for x in splits.test if x in available_scene_names]
+        if len(test_names) == 0:
+            # 官方 test 也不匹配时，就把所有场景都当作 test
+            test_names = available_scene_names
+        train_names, val_names = test_names, []  # test 模式下只用 train_names 这路
+
+    train_scenes = set(name2token[n] for n in train_names)
+    val_scenes   = set(name2token[n] for n in val_names)
+
     if test:
         print('test scene: {}'.format(len(train_scenes)))
     else:
-        print('train scene: {}, val scene: {}'.format(
-            len(train_scenes), len(val_scenes)))
+        print('train scene: {}, val scene: {}'.format(len(train_scenes), len(val_scenes)))
+
     train_nusc_infos, val_nusc_infos = _fill_trainval_infos(
         nusc, train_scenes, val_scenes, test, max_sweeps=max_sweeps)
 
@@ -77,19 +90,15 @@ def create_nuscenes_infos(root_path,
     if test:
         print('test sample: {}'.format(len(train_nusc_infos)))
         data = dict(infos=train_nusc_infos, metadata=metadata)
-        info_path = osp.join(root_path,
-                             '{}_infos_test.pkl'.format(info_prefix))
+        info_path = osp.join(root_path, f'{info_prefix}_infos_test.pkl')
         mmcv.dump(data, info_path)
     else:
-        print('train sample: {}, val sample: {}'.format(
-            len(train_nusc_infos), len(val_nusc_infos)))
+        print('train sample: {}, val sample: {}'.format(len(train_nusc_infos), len(val_nusc_infos)))
         data = dict(infos=train_nusc_infos, metadata=metadata)
-        info_path = osp.join(root_path,
-                             '{}_infos_train.pkl'.format(info_prefix))
-        mmcv.dump(data, info_path)
-        data['infos'] = val_nusc_infos
-        info_val_path = osp.join(root_path,
-                                 '{}_infos_val.pkl'.format(info_prefix))
+        info_train_path = osp.join(root_path, f'{info_prefix}_infos_train.pkl')
+        mmcv.dump(data, info_train_path)
+        data = dict(infos=val_nusc_infos, metadata=metadata)
+        info_val_path = osp.join(root_path, f'{info_prefix}_infos_val.pkl')
         mmcv.dump(data, info_val_path)
 
 
@@ -153,6 +162,22 @@ def _fill_trainval_infos(nusc,
         tuple[list[dict]]: Information of training set and validation set
             that will be saved to the info file.
     """
+    # 在函数开头就判断一下是不是你这个自定义版本
+    is_custom = str(getattr(nusc, 'version', '')).startswith('v1.0-custom')
+        # === 1) 在函数内构建 token->index 映射（来自 nusc.visibility / nusc.attribute） ===
+    vis_name_to_idx = {'v0-40': 0, 'v40-60': 1, 'v60-80': 2, 'v80-100': 3}
+    vis_tok_to_idx  = {v['token']: vis_name_to_idx.get(v['name'], -1)
+                       for v in nusc.visibility}
+
+    cause_name_to_idx = {'none':0, 'grape':1, 'self_fruit':2, 'leaf':3, 'vine':4, 'unknown':5}
+    cause_tok_to_idx  = {}
+    for a in nusc.attribute:
+        name = a['name']  # "occlusion_cause:leaf"
+        if name.startswith('occlusion_cause:'):
+            cause = name.split(':',1)[1]
+            if cause in cause_name_to_idx:
+                cause_tok_to_idx[a['token']] = cause_name_to_idx[cause]
+                
     train_nusc_infos = []
     val_nusc_infos = []
 
@@ -187,22 +212,33 @@ def _fill_trainval_infos(nusc,
         l2e_r_mat = Quaternion(l2e_r).rotation_matrix
         e2g_r_mat = Quaternion(e2g_r).rotation_matrix
 
-        # obtain 6 image's information per frame
-        camera_types = [
-            'CAM_FRONT',
-            'CAM_FRONT_RIGHT',
-            'CAM_FRONT_LEFT',
-            'CAM_BACK',
-            'CAM_BACK_LEFT',
-            'CAM_BACK_RIGHT',
-        ]
+        # # obtain 6 image's information per frame
+        # camera_types = [
+        #     'CAM_FRONT',
+        #     'CAM_FRONT_RIGHT',
+        #     'CAM_FRONT_LEFT',
+        #     'CAM_BACK',
+        #     'CAM_BACK_LEFT',
+        #     'CAM_BACK_RIGHT',
+        # ]
+        # for cam in camera_types:
+        #     cam_token = sample['data'][cam]
+        #     cam_path, _, cam_intrinsic = nusc.get_sample_data(cam_token)
+        #     cam_info = obtain_sensor2top(nusc, cam_token, l2e_t, l2e_r_mat,
+        #                                  e2g_t, e2g_r_mat, cam)
+        #     cam_info.update(cam_intrinsic=cam_intrinsic)
+        #     info['cams'].update({cam: cam_info})
+                # 动态相机列表：只用 sample['data'] 中实际存在的 CAM_*
+        camera_types = [k for k in sample['data'].keys() if k.startswith('CAM_')]
         for cam in camera_types:
+            if cam not in sample['data']:
+                continue
             cam_token = sample['data'][cam]
             cam_path, _, cam_intrinsic = nusc.get_sample_data(cam_token)
             cam_info = obtain_sensor2top(nusc, cam_token, l2e_t, l2e_r_mat,
                                          e2g_t, e2g_r_mat, cam)
             cam_info.update(cam_intrinsic=cam_intrinsic)
-            info['cams'].update({cam: cam_info})
+            info['cams'][cam] = cam_info
 
         # obtain sweeps for a single key-frame
         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
@@ -222,41 +258,89 @@ def _fill_trainval_infos(nusc,
                 nusc.get('sample_annotation', token)
                 for token in sample['anns']
             ]
-            locs = np.array([b.center for b in boxes]).reshape(-1, 3)
-            dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
-            rots = np.array([b.orientation.yaw_pitch_roll[0]
-                             for b in boxes]).reshape(-1, 1)
-            velocity = np.array(
-                [nusc.box_velocity(token)[:2] for token in sample['anns']])
-            valid_flag = np.array(
-                [(anno['num_lidar_pts'] + anno['num_radar_pts']) > 0
-                 for anno in annotations],
-                dtype=bool).reshape(-1)
-            # convert velo from global to lidar
-            for i in range(len(boxes)):
-                velo = np.array([*velocity[i], 0.0])
-                velo = velo @ np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(
-                    l2e_r_mat).T
-                velocity[i] = velo[:2]
 
-            names = [b.name for b in boxes]
-            for i in range(len(names)):
-                if names[i] in NuScenesDataset.NameMapping:
-                    names[i] = NuScenesDataset.NameMapping[names[i]]
-            names = np.array(names)
-            # we need to convert rot to SECOND format.
-            gt_boxes = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)
+            if is_custom:
+                # >>> 关键：直接用 sample_annotation 里的 lidar 坐标 <<<
+                locs = np.array(
+                    [ann['translation'] for ann in annotations],
+                    dtype=np.float32).reshape(-1, 3)
+                dims = np.array(
+                    [ann['size'] for ann in annotations],
+                    dtype=np.float32).reshape(-1, 3)
+                dims = dims[:, [1, 0, 2]]   # [w,l,h] <-> [l,w,h] 互换
+                # rotation: 四元数 -> yaw
+                yaws = []
+                for ann in annotations:
+                    q = Quaternion(ann['rotation'])
+                    yaws.append(q.yaw_pitch_roll[0])
+                rots = np.array(yaws, dtype=np.float32).reshape(-1, 1)
+
+                # 你这里葡萄是静态场景，可以直接置 0
+                velocity = np.zeros((len(annotations), 2), dtype=np.float32)
+
+                # 类别名直接从 category_name 来，再用 NameMapping 映射到 mmdet3d 内部名
+                names = [ann['category_name'] for ann in annotations]
+                for i in range(len(names)):
+                    if names[i] in NuScenesDataset.NameMapping:
+                        names[i] = NuScenesDataset.NameMapping[names[i]]
+                names = np.array(names)
+
+                # rot 转成 SECOND 习惯的格式：[x, y, z, w, l, h, yaw]
+                gt_boxes = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)
+
+                # 有效标记直接全 1（后面由 create_gt_database 按点数再裁剪）
+                valid_flag = np.ones(len(annotations), dtype=bool)
+
+            else:
+                # >>> 原版 nuScenes 分支：保持不动 <<<
+                locs = np.array([b.center for b in boxes]).reshape(-1, 3)
+                dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
+                rots = np.array([b.orientation.yaw_pitch_roll[0]
+                                 for b in boxes]).reshape(-1, 1)
+                velocity = np.array(
+                    [nusc.box_velocity(token)[:2] for token in sample['anns']])
+                valid_flag = np.ones(len(annotations), dtype=bool)
+
+                # 把速度从 global 转回 lidar
+                for i in range(len(boxes)):
+                    velo = np.array([*velocity[i], 0.0])
+                    velo = velo @ np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(
+                        l2e_r_mat).T
+                    velocity[i] = velo[:2]
+
+                names = [b.name for b in boxes]
+                for i in range(len(names)):
+                    if names[i] in NuScenesDataset.NameMapping:
+                        names[i] = NuScenesDataset.NameMapping[names[i]]
+                names = np.array(names)
+                gt_boxes = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)
             assert len(gt_boxes) == len(
                 annotations), f'{len(gt_boxes)}, {len(annotations)}'
+           # >>> 新增：可见度与遮挡因子 <<<
+            gt_vis_labels, gt_cause_labels = [], []
+            for ann in annotations:
+                # visibility
+                vtok = ann.get('visibility_token', '')
+                vis_idx = vis_tok_to_idx.get(vtok, -1) if vtok else -1
+                gt_vis_labels.append(vis_idx)
+                # occlusion_cause: 取第一个匹配的 attribute token；没有就 -1
+                cause_idx = -1
+                for t in ann.get('attribute_tokens', []):
+                    if t in cause_tok_to_idx:
+                        cause_idx = cause_tok_to_idx[t]; break
+                gt_cause_labels.append(cause_idx)
+            gt_vis_labels   = np.array(gt_vis_labels, dtype=np.int64)
+            gt_cause_labels = np.array(gt_cause_labels, dtype=np.int64)
+                        
             info['gt_boxes'] = gt_boxes
             info['gt_names'] = names
             info['gt_velocity'] = velocity.reshape(-1, 2)
-            info['num_lidar_pts'] = np.array(
-                [a['num_lidar_pts'] for a in annotations])
-            info['num_radar_pts'] = np.array(
-                [a['num_radar_pts'] for a in annotations])
+            info['num_lidar_pts'] = np.ones(len(annotations), dtype=np.int32)
+            info['num_radar_pts'] = np.zeros(len(annotations), dtype=np.int32)
             info['valid_flag'] = valid_flag
-
+            info['gt_vis_labels']    = gt_vis_labels
+            info['gt_cause_labels']  = gt_cause_labels  
+                      
         if sample['scene_token'] in train_scenes:
             train_nusc_infos.append(info)
         else:
@@ -352,9 +436,12 @@ def export_2d_annotation(root_path, info_path, version):
     ]
     coco_ann_id = 0
     coco_2d_dict = dict(annotations=[], images=[], categories=cat2Ids)
+    # for info in mmcv.track_iter_progress(nusc_infos):
+    #     for cam in camera_types:
+    #         cam_info = info['cams'][cam]
     for info in mmcv.track_iter_progress(nusc_infos):
-        for cam in camera_types:
-            cam_info = info['cams'][cam]
+        for cam, cam_info in info['cams'].items():
+########################################################################
             coco_infos = get_2d_boxes(
                 nusc,
                 cam_info['sample_data_token'],

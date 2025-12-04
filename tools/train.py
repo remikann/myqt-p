@@ -219,6 +219,16 @@ def main():
 
     logger.info(f'Model:\n{model}')
     datasets = [build_dataset(cfg.data.train)]
+    #-----------------------------------------------------
+    def unwrap_dataset(ds):
+        while hasattr(ds, 'dataset'):
+            ds = ds.dataset
+        return ds
+
+    real_dataset = unwrap_dataset(datasets[0])
+    unique = len({info['lidar_path'] for info in real_dataset.data_infos})
+    print(f"真正的训练样本数量: {unique}")
+    #-----------------------------------------------------
     if len(cfg.workflow) == 2:
         val_dataset = copy.deepcopy(cfg.data.val)
         # in case we use a dataset wrapper

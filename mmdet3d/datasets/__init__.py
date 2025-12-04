@@ -15,6 +15,7 @@ from .semantickitti_dataset import SemanticKITTIDataset
 from .sunrgbd_dataset import SUNRGBDDataset
 from .waymo_dataset import WaymoDataset
 from .nuscenes_dataset_memory import NuScenesDatasetMemory
+from .nuscenes_dataset_grapeonly import NuScenesGrapeDataset
 
 __all__ = [
     'KittiDataset', 'GroupSampler', 'DistributedGroupSampler',
@@ -26,5 +27,5 @@ __all__ = [
     'LoadAnnotations3D', 'SUNRGBDDataset', 'ScanNetDataset',
     'SemanticKITTIDataset', 'Custom3DDataset', 'LoadPointsFromMultiSweeps',
     'WaymoDataset', 'BackgroundPointsFilter', 'VoxelBasedPointSampler',
-    'NuScenesDatasetMemory'
+    'NuScenesDatasetMemory','NuScenesGrapeDataset',
 ]

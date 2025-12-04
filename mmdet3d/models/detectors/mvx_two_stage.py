@@ -483,43 +483,75 @@ class MVXTwoStageDetector(Base3DDetector):
             result (dict): Prediction results.
             out_dir (str): Output directory of visualization result.
         """
-        for batch_id in range(len(result)):
-            if isinstance(data['points'][0], DC):
-                points = data['points'][0]._data[0][batch_id].numpy()
-            elif mmcv.is_list_of(data['points'][0], torch.Tensor):
-                points = data['points'][0][batch_id]
-            else:
-                ValueError(f"Unsupported data type {type(data['points'][0])} "
-                           f'for visualization!')
-            if isinstance(data['img_metas'][0], DC):
-                pts_filename = data['img_metas'][0]._data[0][batch_id][
-                    'pts_filename']
-                box_mode_3d = data['img_metas'][0]._data[0][batch_id][
-                    'box_mode_3d']
-            elif mmcv.is_list_of(data['img_metas'][0], dict):
-                pts_filename = data['img_metas'][0][batch_id]['pts_filename']
-                box_mode_3d = data['img_metas'][0][batch_id]['box_mode_3d']
-            else:
-                ValueError(
-                    f"Unsupported data type {type(data['img_metas'][0])} "
-                    f'for visualization!')
-            file_name = osp.split(pts_filename)[-1].split('.')[0]
+        from mmcv.parallel import DataContainer as DC
+        import torch, os
+        import numpy as np
+        from mmdet3d.core import Box3DMode, Coord3DMode
+        from mmdet3d.core.visualizer import show_result
+        def _unwrap_dc(x):
+            """Return the real payload for DC / [DC] / object."""
+            # 直接是 DC
+            if isinstance(x, DC):
+                return x._data[0]  # 与你项目中已有用法一致
+            # 列表/元组
+            if isinstance(x, (list, tuple)) and len(x) > 0:
+                first = x[0]
+                if isinstance(first, DC):
+                    return first._data[0]
+                return x  # 已经是展开后的 list
+            # 已经是普通对象
+            return x
 
-            assert out_dir is not None, 'Expect out_dir, got none.'
-            inds = result[batch_id]['pts_bbox']['scores_3d'] > 0.1
-            pred_bboxes = result[batch_id]['pts_bbox']['boxes_3d'][inds]
+        # 统一解包
+        points_pack = _unwrap_dc(data['points'])
+        img_metas_pack = _unwrap_dc(data['img_metas'])
 
-            # for now we convert points and bbox into depth mode
-            if (box_mode_3d == Box3DMode.CAM) or (box_mode_3d
-                                                  == Box3DMode.LIDAR):
-                points = Coord3DMode.convert_point(points, Coord3DMode.LIDAR,
-                                                   Coord3DMode.DEPTH)
-                pred_bboxes = Box3DMode.convert(pred_bboxes, box_mode_3d,
-                                                Box3DMode.DEPTH)
+        assert out_dir is not None, 'Expect out_dir, got none.'
+        os.makedirs(out_dir, exist_ok=True)
+
+        batch_size = len(result)
+        for batch_id in range(batch_size):
+            # 取本样本的点云
+            if isinstance(points_pack, (list, tuple)):
+                pts = points_pack[batch_id]
+            else:
+                # points_pack 是 Tensor 或 ndarray
+                pts = points_pack
+
+            if torch.is_tensor(pts):
+                pts_np = pts.detach().cpu().numpy()
+            else:
+                pts_np = np.asarray(pts)
+
+            # 取本样本的 meta
+            if isinstance(img_metas_pack, (list, tuple)):
+                meta_i = img_metas_pack[batch_id]
+            else:
+                meta_i = img_metas_pack  # 已经是 dict
+
+            if not isinstance(meta_i, dict):
+                raise TypeError(f'Unsupported img_metas type: {type(meta_i)}')
+
+            pts_filename = meta_i.get('pts_filename', f'sample_{batch_id}.bin')
+            box_mode_3d = meta_i['box_mode_3d']
+            file_name = osp.splitext(osp.basename(pts_filename))[0]
+
+            # 预测框（按你原逻辑筛阈值）
+            det = result[batch_id]['pts_bbox']
+            scores_3d = det['scores_3d']
+            inds = scores_3d > 0.1
+            pred_bboxes = det['boxes_3d'][inds]
+
+            # 坐标系转换：统一到 DEPTH（与原实现一致）
+            if (box_mode_3d == Box3DMode.CAM) or (box_mode_3d == Box3DMode.LIDAR):
+                pts_np = Coord3DMode.convert_point(pts_np, Coord3DMode.LIDAR, Coord3DMode.DEPTH)
+                pred_bboxes = Box3DMode.convert(pred_bboxes, box_mode_3d, Box3DMode.DEPTH)
             elif box_mode_3d != Box3DMode.DEPTH:
-                ValueError(
-                    f'Unsupported box_mode_3d {box_mode_3d} for convertion!')
+                raise ValueError(f'Unsupported box_mode_3d {box_mode_3d} for conversion!')
 
-            pred_bboxes = pred_bboxes.tensor.cpu().numpy()
-            show_result(points, None, pred_bboxes, out_dir, file_name)
+            pred_bboxes = pred_bboxes.tensor.detach().cpu().numpy()
+
+            # 可视化输出
+            show_result(pts_np, None, pred_bboxes, out_dir, file_name)
+
 

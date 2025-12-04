@@ -7,7 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from torch.nn import Linear
-from torch.nn.init import xavier_uniform_, constant_
+from torch.nn.init import xavier_uniform_, constant_, xavier_normal_
 
 from mmdet3d.core import (circle_nms, draw_heatmap_gaussian, gaussian_radius,
                           xywhr2xyxyr, limit_period, PseudoSampler)
@@ -20,7 +20,27 @@ from mmdet3d.models.fusion_layers import apply_3d_transformation
 from mmdet3d.ops.iou3d.iou3d_utils import nms_gpu
 from mmdet.core import build_bbox_coder, multi_apply, build_assigner, build_sampler, AssignResult
 from mmdet3d.ops.roiaware_pool3d import points_in_boxes_batch
+# --- debug utils: safe rank & logging on rank0 only ---
+import os, logging
+try:
+    from mmcv.runner import get_dist_info
+except Exception:
+    get_dist_info = None
 
+def _is_main_process() -> bool:
+    # 在分布式未初始化时也返回 True，避免“rank 未定义”
+    try:
+        if get_dist_info is None:
+            return True
+        rank, _world = get_dist_info()
+        return (rank == 0)
+    except Exception:
+        return True
+
+def _log_rank0(msg: str):
+    if _is_main_process():
+        print(msg)
+# ------------------------------------------------------
 
 class PositionEmbeddingLearned(nn.Module):
     """
@@ -181,7 +201,8 @@ class MultiheadAttention(nn.Module):
         self.add_zero_attn = add_zero_attn
 
         self._reset_parameters()
-
+        self._debug_printed = False
+        
     def _reset_parameters(self):
         if self._qkv_same_embed_dim:
             xavier_uniform_(self.in_proj_weight)
@@ -623,6 +644,9 @@ class TransFusionHead(nn.Module):
                  loss_iou=dict(type='VarifocalLoss', use_sigmoid=True, iou_weighted=True, reduction='mean'),
                  loss_bbox=dict(type='L1Loss', reduction='mean'),
                  loss_heatmap=dict(type='GaussianFocalLoss', reduction='mean'),
+                 with_aux_attr=False, num_vis=4, num_cause=6,
+                 loss_vis=dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.2),
+                 loss_cause=dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.2),
                  # others
                  train_cfg=None,
                  test_cfg=None,
@@ -704,7 +728,17 @@ class TransFusionHead(nn.Module):
                     self_posembed=PositionEmbeddingLearned(2, hidden_channel),
                     cross_posembed=PositionEmbeddingLearned(2, hidden_channel),
                 ))
-
+        # auxiliary attribute prediction 
+        self.with_aux_attr = with_aux_attr
+        if self.with_aux_attr:
+            self.num_vis = num_vis
+            self.num_cause = num_cause
+            # 用 1x1 conv 在 proposal 维上出 logits（也可用 Linear）
+            self.vis_head   = nn.Conv1d(hidden_channel, self.num_vis, kernel_size=1)
+            self.cause_head = nn.Conv1d(hidden_channel, self.num_cause, kernel_size=1)
+            self.loss_vis   = build_loss(loss_vis)
+            self.loss_cause = build_loss(loss_cause)
+            self.attr_ignore_index = -1
         # Prediction Head
         self.prediction_heads = nn.ModuleList()
         for i in range(self.num_decoder_layers):
@@ -757,6 +791,23 @@ class TransFusionHead(nn.Module):
 
         self.img_feat_pos = None
         self.img_feat_collapsed_pos = None
+    def _feat_hw_from_cfg(self):
+        """
+        Compute (H, W) of BEV feature map from config, independent of forward() outputs.
+        Uses train_cfg first, then fall back to test_cfg.
+        """
+        cfg_src = self.train_cfg if self.train_cfg is not None else self.test_cfg
+        assert cfg_src is not None, "Both train_cfg and test_cfg are None; cannot compute feature map size."
+        assert 'grid_size' in cfg_src and 'out_size_factor' in cfg_src, \
+            "Missing 'grid_size' or 'out_size_factor' in cfg; please set them in config."
+
+        # grid_size order is [x_len, y_len, z_len]; BEV feature uses x,y.
+        x_len, y_len = cfg_src['grid_size'][0], cfg_src['grid_size'][1]
+        osf = cfg_src['out_size_factor']
+        # W 对应 x 方向，H 对应 y 方向（和常见 [B, C, H, W] 一致）
+        W = int(np.floor(x_len / osf))
+        H = int(np.floor(y_len / osf))
+        return H, W
 
     def create_2D_grid(self, x_size, y_size):
         meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]
@@ -796,6 +847,16 @@ class TransFusionHead(nn.Module):
             self.bbox_assigner = [
                 build_assigner(res) for res in self.train_cfg.assigner
             ]
+    # 在 class TransFusionHead(nn.Module): 内部，加上
+    def _as_list_of_dicts(self, outs):
+        """保证前向输出统一成 list[dict] 的形式（即使只有一层解码器）"""
+        if isinstance(outs, dict):
+            return [outs]
+        elif isinstance(outs, (list, tuple)):
+            # 容错：有时返回的是 tuple
+            return list(outs)
+        else:
+            raise TypeError(f'Unexpected preds type: {type(outs)}; expect dict or list[dict].')
 
     def forward_single(self, inputs, img_inputs, img_metas):
         """Forward function for CenterPoint.
@@ -853,38 +914,64 @@ class TransFusionHead(nn.Module):
             local_max[:, :, padding:(-padding), padding:(-padding)] = local_max_inner
             ## for Pedestrian & Traffic_cone in nuScenes
             if self.test_cfg['dataset'] == 'nuScenes':
-                local_max[:, 8, ] = F.max_pool2d(heatmap[:, 8], kernel_size=1, stride=1, padding=0)
-                local_max[:, 9, ] = F.max_pool2d(heatmap[:, 9], kernel_size=1, stride=1, padding=0)
+                # local_max[:, 8, ] = F.max_pool2d(heatmap[:, 8], kernel_size=1, stride=1, padding=0)
+                # local_max[:, 9, ] = F.max_pool2d(heatmap[:, 9], kernel_size=1, stride=1, padding=0)
+
+                local_max = F.max_pool2d(
+                    heatmap, kernel_size=self.nms_kernel_size, stride=1,
+                    padding=self.nms_kernel_size // 2
+                )
+                # 仅当这些通道存在时才做“1x1 特例”
+                for k in (8, 9):
+                    if heatmap.shape[1] > k:
+                        # 注意保持维度：使用切片 k:k+1，再 squeeze 回来
+                        local_max[:, k] = F.max_pool2d(
+                            heatmap[:, k:k+1], kernel_size=1, stride=1, padding=0
+                        ).squeeze(1)
             elif self.test_cfg['dataset'] == 'Waymo':  # for Pedestrian & Cyclist in Waymo
                 local_max[:, 1, ] = F.max_pool2d(heatmap[:, 1], kernel_size=1, stride=1, padding=0)
                 local_max[:, 2, ] = F.max_pool2d(heatmap[:, 2], kernel_size=1, stride=1, padding=0)
-            heatmap = heatmap * (heatmap == local_max)
-            heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
+            # heatmap = heatmap * (heatmap == local_max)
+            # heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
 
-            # top #num_proposals among all classes
-            top_proposals = heatmap.view(batch_size, -1).argsort(dim=-1, descending=True)[..., :self.num_proposals]
-            top_proposals_class = top_proposals // heatmap.shape[-1]
-            top_proposals_index = top_proposals % heatmap.shape[-1]
+            # # top #num_proposals among all classes
+            # top_proposals = heatmap.view(batch_size, -1).argsort(dim=-1, descending=True)[..., :self.num_proposals]
+            # top_proposals_class = top_proposals // heatmap.shape[-1]
+            # top_proposals_index = top_proposals % heatmap.shape[-1]
+            heatmap = heatmap * (heatmap == local_max)
+            # NOTE: 先保留 H、W，再展平成 [B, C, H*W]，这样类别与平面索引的拆分最清晰
+            B, C, H, W = heatmap.shape
+            # after: B, C, H, W = heatmap.shape
+            if _is_main_process():
+                if C != self.num_classes:
+                    _log_rank0(f"[TransFusionHead] heatmap C({C}) != num_classes({self.num_classes})")
+                else:
+                    _log_rank0(f"[TransFusionHead] heatmap OK: C={C}, num_classes={self.num_classes}, H={H}, W={W}, K={self.num_proposals}")
+            assert C == self.num_classes, \
+                f"Heatmap channel ({C}) must equal num_classes ({self.num_classes})."
+            # K 合法性
+            assert self.num_proposals <= (C * H * W), \
+                f"num_proposals({self.num_proposals}) > C*H*W({C*H*W})"
+
+            # nms kernel 合法（必须是正奇数；否则 padding/slice 会出错）
+            if hasattr(self, 'nms_kernel_size'):
+                k = int(self.nms_kernel_size)
+                assert k >= 1 and (k % 2 == 1), \
+                    f"nms_kernel_size({self.nms_kernel_size}) must be an odd positive int"    
+                    
+            heatmap = heatmap.view(B, C, H * W)
+
+            # top #num_proposals among all classes（在 C*H*W 里选 K）
+            top_proposals = heatmap.view(B, -1).argsort(dim=-1, descending=True)[..., :self.num_proposals]
+            # 类别 = // (H*W)；用 torch.div 消除 __floordiv__ 警告（行为与原来一致，等价于“向 0 取整”）
+            top_proposals_class = torch.div(top_proposals, H * W, rounding_mode='trunc')
+            # 平面内索引 = % (H*W)
+            top_proposals_index = top_proposals % (H * W)
+            # 防呆：类别索引应在 [0, C)
+            assert top_proposals_class.max() < C and top_proposals_class.min() >= 0
             query_feat = lidar_feat_flatten.gather(index=top_proposals_index[:, None, :].expand(-1, lidar_feat_flatten.shape[1], -1), dim=-1)
             self.query_labels = top_proposals_class
             
-            #--------------------------------------------------------------------------------------------
-            # 在此处添加保存query_feat的代码  
-            # 获取当前样本的文件名  
-            name = img_metas[0]['pts_filename'].split('/')[-1].split('.')[0] + '.bin'
-            # 确定保存路径（根据是否为测试模式）  
-            memory_bank_root = self.test_cfg.get('memory_bank_root', 'data/nuscenes/memorybank1/transfusionL/')  
-            if self.training:  
-                out_path = memory_bank_root + 'queries/train/'   
-            else:  
-                out_path = memory_bank_root + 'queries/val/'
-            # 确保目录存在  
-            import os  
-            os.makedirs(out_path, exist_ok=True)  
-            # 保存查询特征为npy文件  
-            query_feat_np = query_feat.detach().cpu().numpy()  
-            np.save(out_path + name, query_feat_np)
-            #--------------------------------------------------------------------------------------------
             
             # add category embedding
             one_hot = F.one_hot(top_proposals_class, num_classes=self.num_classes).permute(0, 2, 1)
@@ -895,7 +982,8 @@ class TransFusionHead(nn.Module):
         else:
             query_feat = self.query_feat.repeat(batch_size, 1, 1)  # [BS, C, num_proposals]
             base_xyz = self.query_pos.repeat(batch_size, 1, 1).to(lidar_feat.device)  # [BS, num_proposals, 2]
-
+            # ★ 关键：A 方案下显式给 query_pos，避免后面 decoder 使用时报 UnboundLocalError
+            query_pos = base_xyz
         #################################
         # transformer decoder layer (LiDAR feature as K,V)
         #################################
@@ -906,10 +994,16 @@ class TransFusionHead(nn.Module):
             # Transformer Decoder Layer
             # :param query: B C Pq    :param query_pos: B Pq 3/6
             query_feat = self.decoder[i](query_feat, lidar_feat_flatten, query_pos, bev_pos)
-
+            
             # Prediction
             res_layer = self.prediction_heads[i](query_feat)
             res_layer['center'] = res_layer['center'] + query_pos.permute(0, 2, 1)
+            if self.with_aux_attr and i == self.num_decoder_layers - 1:
+            # query_feat: [B, C, num_proposals]
+                vis_logits   = self.vis_head(query_feat)      # [B, 4, K]
+                cause_logits = self.cause_head(query_feat)    # [B, 6, K]
+                res_layer['vis_logits']   = vis_logits
+                res_layer['cause_logits'] = cause_logits            
             first_res_layer = res_layer
             if not self.fuse_img:
                 ret_dicts.append(res_layer)
@@ -1042,14 +1136,21 @@ class TransFusionHead(nn.Module):
             return [ret_dicts[-1]]
 
         # return all the layer's results for auxiliary superivison
+        # new_res = {}
+        # for key in ret_dicts[0].keys():
+        #     if key not in ['dense_heatmap', 'dense_heatmap_old', 'query_heatmap_score']:
+        #         new_res[key] = torch.cat([ret_dict[key] for ret_dict in ret_dicts], dim=-1)
+        #     else:
+        #         new_res[key] = ret_dicts[0][key]
+        # return [new_res]
+        keys = set().union(*[d.keys() for d in ret_dicts])   # 用所有层的并集
         new_res = {}
-        for key in ret_dicts[0].keys():
-            if key not in ['dense_heatmap', 'dense_heatmap_old', 'query_heatmap_score']:
-                new_res[key] = torch.cat([ret_dict[key] for ret_dict in ret_dicts], dim=-1)
+        for k in keys:
+            if k in ['dense_heatmap', 'dense_heatmap_old', 'query_heatmap_score']:
+                new_res[k] = ret_dicts[0][k]
             else:
-                new_res[key] = ret_dicts[0][key]
+                new_res[k] = torch.cat([d[k] for d in ret_dicts if k in d], dim=-1)
         return [new_res]
-
     def forward(self, feats, img_feats, img_metas):
         """Forward pass.
 
@@ -1064,7 +1165,7 @@ class TransFusionHead(nn.Module):
             img_feats = [None]
         res = multi_apply(self.forward_single, feats, img_feats, [img_metas])
         assert len(res) == 1, "only support one level features."
-        return res
+        return res[0]
 
     def get_targets(self, gt_bboxes_3d, gt_labels_3d, preds_dict):
         """Generate training targets.
@@ -1084,6 +1185,7 @@ class TransFusionHead(nn.Module):
         """
         # change preds_dict into list of dict (index by batch_id)
         # preds_dict[0]['center'].shape [bs, 3, num_proposal]
+        
         list_of_pred_dict = []
         for batch_idx in range(len(gt_bboxes_3d)):
             pred_dict = {}
@@ -1103,9 +1205,11 @@ class TransFusionHead(nn.Module):
         matched_ious = np.mean(res_tuple[6])
         if self.initialize_by_heatmap:
             heatmap = torch.cat(res_tuple[7], dim=0)
-            return labels, label_weights, bbox_targets, bbox_weights, ious, num_pos, matched_ious, heatmap
+            assigned_gt_inds_full = torch.cat(res_tuple[8], dim=0)  # ← 新增
+            return (labels, label_weights, bbox_targets, bbox_weights,ious, num_pos, matched_ious, heatmap, assigned_gt_inds_full)
         else:
-            return labels, label_weights, bbox_targets, bbox_weights, ious, num_pos, matched_ious
+            assigned_gt_inds_full = torch.cat(res_tuple[7], dim=0)  # ← 新增
+            return (labels, label_weights, bbox_targets, bbox_weights,ious, num_pos, matched_ious, assigned_gt_inds_full)
 
     def get_targets_single(self, gt_bboxes_3d, gt_labels_3d, preds_dict, batch_idx):
         """Generate training targets for a single sample.
@@ -1160,18 +1264,51 @@ class TransFusionHead(nn.Module):
                 raise NotImplementedError
             assign_result_list.append(assign_result)
 
-        # combine assign result of each layer
+        # # combine assign result of each layer
+        # assign_result_ensemble = AssignResult(
+        #     num_gts=sum([res.num_gts for res in assign_result_list]),a
+        #     gt_inds=torch.cat([res.gt_inds for res in assign_result_list]),
+        #     max_overlaps=torch.cat([res.max_overlaps for res in assign_result_list]),
+        #     labels=torch.cat([res.labels for res in assign_result_list]),
+        # )
+        # ---- 鲁棒合并：过滤 None，避免 torch.cat 遇到 NoneType
+        valid = [res for res in assign_result_list
+                 if (res is not None and getattr(res, 'max_overlaps', None) is not None)]
+        if len(valid) == 0:
+            # 没有任何有效分配：返回一组“全负样本”占位，保证训练继续
+            device = center.device
+            labels = bboxes_tensor.new_zeros(num_proposals, dtype=torch.long) + self.num_classes
+            label_weights = bboxes_tensor.new_zeros(num_proposals, dtype=torch.long)
+            bbox_targets = bboxes_tensor.new_zeros(num_proposals, self.bbox_coder.code_size)
+            bbox_weights = bboxes_tensor.new_zeros_like(bbox_targets)
+            ious = bboxes_tensor.new_zeros(num_proposals)
+            if self.initialize_by_heatmap:
+                grid_size = torch.as_tensor(self.train_cfg['grid_size'])
+                feature_hw = torch.div(grid_size[:2], self.train_cfg['out_size_factor'], rounding_mode='trunc')
+                heatmap = bbox_targets.new_zeros(self.num_classes, feature_hw[1], feature_hw[0])
+                return (labels[None], label_weights[None], bbox_targets[None], bbox_weights[None],
+                        ious[None], 0, 0.0, heatmap[None])
+            else:
+                return (labels[None], label_weights[None], bbox_targets[None], bbox_weights[None],
+                        ious[None], 0, 0.0)
+
+        # 正常合并有效的层
         assign_result_ensemble = AssignResult(
-            num_gts=sum([res.num_gts for res in assign_result_list]),
-            gt_inds=torch.cat([res.gt_inds for res in assign_result_list]),
-            max_overlaps=torch.cat([res.max_overlaps for res in assign_result_list]),
-            labels=torch.cat([res.labels for res in assign_result_list]),
+            num_gts=sum([res.num_gts for res in valid]),
+            gt_inds=torch.cat([res.gt_inds for res in valid]),
+            max_overlaps=torch.cat([res.max_overlaps for res in valid]),
+            labels=torch.cat([res.labels for res in valid]),
         )
         sampling_result = self.bbox_sampler.sample(assign_result_ensemble, bboxes_tensor, gt_bboxes_tensor)
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
         assert len(pos_inds) + len(neg_inds) == num_proposals
-
+        # === 新增：为每个 proposal 记录它匹配到的 gt 索引（负样本为 -1） ===
+        assigned_gt_inds_full = torch.full(
+            (num_proposals,), -1, dtype=torch.long, device=bboxes_tensor.device
+        )
+        if len(pos_inds) > 0:
+            assigned_gt_inds_full[pos_inds] = sampling_result.pos_assigned_gt_inds
         # create target for loss computation
         bbox_targets = torch.zeros([num_proposals, self.bbox_coder.code_size]).to(center.device)
         bbox_weights = torch.zeros([num_proposals, self.bbox_coder.code_size]).to(center.device)
@@ -1205,195 +1342,305 @@ class TransFusionHead(nn.Module):
         # # compute dense heatmap targets
         if self.initialize_by_heatmap:
             device = labels.device
-            gt_bboxes_3d = torch.cat([gt_bboxes_3d.gravity_center, gt_bboxes_3d.tensor[:, 3:]], dim=1).to(device)
-            grid_size = torch.tensor(self.train_cfg['grid_size'])
-            pc_range = torch.tensor(self.train_cfg['point_cloud_range'])
-            voxel_size = torch.tensor(self.train_cfg['voxel_size'])
-            feature_map_size = grid_size[:2] // self.train_cfg['out_size_factor']  # [x_len, y_len]
-            heatmap = gt_bboxes_3d.new_zeros(self.num_classes, feature_map_size[1], feature_map_size[0])
+            # [B, 7] -> [x, y, z, dx, dy, dz, yaw]，这里与原逻辑一致
+            gt_bboxes_3d = torch.cat(
+                [gt_bboxes_3d.gravity_center, gt_bboxes_3d.tensor[:, 3:]],
+                dim=1
+            ).to(device)
+
+            pc_range   = torch.as_tensor(self.train_cfg['point_cloud_range'], device=device)
+            voxel_size = torch.as_tensor(self.train_cfg['voxel_size'], device=device)
+            osf        = int(self.train_cfg['out_size_factor'])
+
+            # 1) 优先从当前样本的 preds_dict 里推断 (H, W)
+            #    你的 forward 会把 dense_heatmap 放到 ret_dicts[0]['dense_heatmap']，进入 get_targets_single 时是单样本的 dict
+            if isinstance(preds_dict, dict) and ('dense_heatmap' in preds_dict) and (preds_dict['dense_heatmap'] is not None):
+                # shape: [1, C, H, W] 或 [C, H, W]
+                dhm = preds_dict['dense_heatmap']
+                H, W = int(dhm.shape[-2]), int(dhm.shape[-1])
+            else:
+                # 2) 兜底：从配置推断 (H, W) = grid_size[:2] // out_size_factor
+                grid_size_xy = torch.as_tensor(self.train_cfg['grid_size'][:2], device=device)
+                W = int(grid_size_xy[0].item() // osf)   # x_len
+                H = int(grid_size_xy[1].item() // osf)   # y_len
+
+            # 注意：feature_map_size 在你原注释里是 [x_len, y_len] = [W, H]
+            feature_map_size = torch.tensor([W, H], device=device, dtype=torch.long)
+
+            # 可选一次性打印，便于核对
+            if (not hasattr(self, '_dbg_printed')) or (self._dbg_printed is False):
+                print(f"[TransFusionHead][DEBUG] feature_map_size(x,y)=({W},{H})")
+                self._dbg_printed = True
+
+            # 构建密集热力图标签：形状 [num_classes, H, W]
+            heatmap = gt_bboxes_3d.new_zeros(self.num_classes, H, W)
+
             for idx in range(len(gt_bboxes_3d)):
-                width = gt_bboxes_3d[idx][3]
-                length = gt_bboxes_3d[idx][4]
-                width = width / voxel_size[0] / self.train_cfg['out_size_factor']
-                length = length / voxel_size[1] / self.train_cfg['out_size_factor']
-                if width > 0 and length > 0:
-                    radius = gaussian_radius((length, width), min_overlap=self.train_cfg['gaussian_overlap'])
-                    radius = max(self.train_cfg['min_radius'], int(radius))
+                # 你的宽长定义与原实现保持一致：先按真实尺寸，再换算到特征图单位
+                w = ((gt_bboxes_3d[idx][3] / voxel_size[0]) / osf).to(device=device, dtype=torch.float32)
+                l = ((gt_bboxes_3d[idx][4] / voxel_size[1]) / osf).to(device=device, dtype=torch.float32)
+
+                # 注意：0 维 tensor 不能直接用于 if，先 .item()
+                if (w.item() > 0.0) and (l.item() > 0.0):
+                    mo = torch.tensor(float(self.train_cfg['gaussian_overlap']),
+                                    device=device, dtype=torch.float32)
+                    # 传入 (tensor, tensor) 而不是 float
+                    radius_t = gaussian_radius((l, w), min_overlap=mo)  # 返回 tensor
+                    # 转成 Python int，并与 min_radius 取最大值
+                    radius = max(int(self.train_cfg['min_radius']), int(radius_t.item()))
+
+                    # 中心点从真实坐标 -> 网格坐标 -> 特征图坐标
                     x, y = gt_bboxes_3d[idx][0], gt_bboxes_3d[idx][1]
+                    coor_x = (x - pc_range[0]) / voxel_size[0] / osf
+                    coor_y = (y - pc_range[1]) / voxel_size[1] / osf
 
-                    coor_x = (x - pc_range[0]) / voxel_size[0] / self.train_cfg['out_size_factor']
-                    coor_y = (y - pc_range[1]) / voxel_size[1] / self.train_cfg['out_size_factor']
-
-                    center = torch.tensor([coor_x, coor_y], dtype=torch.float32, device=device)
+                    center     = torch.tensor([coor_x, coor_y], dtype=torch.float32, device=device)
                     center_int = center.to(torch.int32)
+
+                    # 画二维高斯
                     draw_heatmap_gaussian(heatmap[gt_labels_3d[idx]], center_int, radius)
-
             mean_iou = ious[pos_inds].sum() / max(len(pos_inds), 1)
-            return labels[None], label_weights[None], bbox_targets[None], bbox_weights[None], ious[None], int(pos_inds.shape[0]), float(mean_iou), heatmap[None]
-
+            # return labels[None], label_weights[None], bbox_targets[None], bbox_weights[None], ious[None], int(pos_inds.shape[0]), float(mean_iou), heatmap[None]
+            return (labels[None], label_weights[None], bbox_targets[None], bbox_weights[None],ious[None], int(pos_inds.shape[0]), float(mean_iou), heatmap[None], assigned_gt_inds_full[None])
         else:
             mean_iou = ious[pos_inds].sum() / max(len(pos_inds), 1)
-            return labels[None], label_weights[None], bbox_targets[None], bbox_weights[None], ious[None], int(pos_inds.shape[0]), float(mean_iou)
+            # return labels[None], label_weights[None], bbox_targets[None], bbox_weights[None], ious[None], int(pos_inds.shape[0]), float(mean_iou)
+            return (labels[None], label_weights[None], bbox_targets[None], bbox_weights[None],ious[None], int(pos_inds.shape[0]), float(mean_iou), assigned_gt_inds_full[None])
 
-    @force_fp32(apply_to=('preds_dicts'))
-    def loss(self, gt_bboxes_3d, gt_labels_3d, preds_dicts, **kwargs):
-        """Loss function for CenterHead.
+    
+    @force_fp32(apply_to=('preds_dicts',))
+    def loss(self, gt_bboxes_3d, gt_labels_3d, preds_dicts,
+            gt_vis_labels_list=None, gt_cause_labels_list=None,
+            img_metas=None, **kwargs):
+        """Loss function for TransFusion head (+ optional visibility / cause)."""
 
-        Args:
-            gt_bboxes_3d (list[:obj:`LiDARInstance3DBoxes`]): Ground
-                truth gt boxes.
-            gt_labels_3d (list[torch.Tensor]): Labels of boxes.
-            preds_dicts (list[list[dict]]): Output of forward function.
+        assert isinstance(preds_dicts, (list, tuple)) and len(preds_dicts) >= 1
+        preds_dict = preds_dicts[0]  # merged dict after forward()
 
-        Returns:
-            dict[str:torch.Tensor]: Loss of heatmap and bbox of each task.
-        """
-        if self.initialize_by_heatmap:
-            labels, label_weights, bbox_targets, bbox_weights, ious, num_pos, matched_ious, heatmap = self.get_targets(gt_bboxes_3d, gt_labels_3d, preds_dicts[0])
-        else:
-            labels, label_weights, bbox_targets, bbox_weights, ious, num_pos, matched_ious = self.get_targets(gt_bboxes_3d, gt_labels_3d, preds_dicts[0])
-        if hasattr(self, 'on_the_image_mask'):
-            label_weights = label_weights * self.on_the_image_mask
-            bbox_weights = bbox_weights * self.on_the_image_mask[:, :, None]
-            num_pos = bbox_weights.max(-1).values.sum()
-        preds_dict = preds_dicts[0][0]
         loss_dict = dict()
 
+        # -------- 1) 取 targets（兼容：是否带 heatmap / 是否带匹配索引） --------
         if self.initialize_by_heatmap:
-            # compute heatmap loss
-            loss_heatmap = self.loss_heatmap(clip_sigmoid(preds_dict['dense_heatmap']), heatmap, avg_factor=max(heatmap.eq(1).float().sum().item(), 1))
+            ret = self.get_targets(gt_bboxes_3d, gt_labels_3d, preds_dicts)
+            if len(ret) == 9:
+                labels, label_weights, bbox_targets, bbox_weights, ious, num_pos, matched_ious, heatmap, assigned_gt_inds_full = ret
+            else:
+                labels, label_weights, bbox_targets, bbox_weights, ious, num_pos, matched_ious, heatmap = ret
+                assigned_gt_inds_full = None
+        else:
+            ret = self.get_targets(gt_bboxes_3d, gt_labels_3d, preds_dicts)
+            if len(ret) == 8:
+                labels, label_weights, bbox_targets, bbox_weights, ious, num_pos, matched_ious, assigned_gt_inds_full = ret
+            else:
+                labels, label_weights, bbox_targets, bbox_weights, ious, num_pos, matched_ious = ret
+                assigned_gt_inds_full = None
+
+        # if hasattr(self, 'on_the_image_mask'):
+        #     label_weights = label_weights * self.on_the_image_mask
+        #     bbox_weights  = bbox_weights * self.on_the_image_mask[:, :, None]
+            num_pos = bbox_weights.max(-1).values.sum()
+
+        # -------- 2) heatmap loss（可选） --------
+        if self.initialize_by_heatmap and 'dense_heatmap' in preds_dict:
+            loss_heatmap = self.loss_heatmap(
+                clip_sigmoid(preds_dict['dense_heatmap']),
+                heatmap,
+                avg_factor=max(heatmap.eq(1).float().sum().item(), 1)
+            )
             loss_dict['loss_heatmap'] = loss_heatmap
 
-        # compute loss for each layer
-        for idx_layer in range(self.num_decoder_layers if self.auxiliary else 1):
-            if idx_layer == self.num_decoder_layers - 1 or (idx_layer == 0 and self.auxiliary is False):
+        # -------- 3) 各层分类/回归损失 --------
+        total_layers = self.num_decoder_layers if self.auxiliary else 1
+        for idx_layer in range(total_layers):
+            if idx_layer == self.num_decoder_layers - 1 or (idx_layer == 0 and not self.auxiliary):
                 prefix = 'layer_-1'
             else:
                 prefix = f'layer_{idx_layer}'
 
-            layer_labels = labels[..., idx_layer * self.num_proposals:(idx_layer + 1) * self.num_proposals].reshape(-1)
-            layer_label_weights = label_weights[..., idx_layer * self.num_proposals:(idx_layer + 1) * self.num_proposals].reshape(-1)
-            layer_score = preds_dict['heatmap'][..., idx_layer * self.num_proposals:(idx_layer + 1) * self.num_proposals]
-            layer_cls_score = layer_score.permute(0, 2, 1).reshape(-1, self.num_classes)
-            layer_loss_cls = self.loss_cls(layer_cls_score, layer_labels, layer_label_weights, avg_factor=max(num_pos, 1))
+            sl = slice(idx_layer * self.num_proposals, (idx_layer + 1) * self.num_proposals)
 
-            layer_center = preds_dict['center'][..., idx_layer * self.num_proposals:(idx_layer + 1) * self.num_proposals]
-            layer_height = preds_dict['height'][..., idx_layer * self.num_proposals:(idx_layer + 1) * self.num_proposals]
-            layer_rot = preds_dict['rot'][..., idx_layer * self.num_proposals:(idx_layer + 1) * self.num_proposals]
-            layer_dim = preds_dict['dim'][..., idx_layer * self.num_proposals:(idx_layer + 1) * self.num_proposals]
-            preds = torch.cat([layer_center, layer_height, layer_dim, layer_rot], dim=1).permute(0, 2, 1)  # [BS, num_proposals, code_size]
-            if 'vel' in preds_dict.keys():
-                layer_vel = preds_dict['vel'][..., idx_layer * self.num_proposals:(idx_layer + 1) * self.num_proposals]
-                preds = torch.cat([layer_center, layer_height, layer_dim, layer_rot, layer_vel], dim=1).permute(0, 2, 1)  # [BS, num_proposals, code_size]
-            code_weights = self.train_cfg.get('code_weights', None)
-            layer_bbox_weights = bbox_weights[:, idx_layer * self.num_proposals:(idx_layer + 1) * self.num_proposals, :]
-            layer_reg_weights = layer_bbox_weights * layer_bbox_weights.new_tensor(code_weights)
-            layer_bbox_targets = bbox_targets[:, idx_layer * self.num_proposals:(idx_layer + 1) * self.num_proposals, :]
+            # cls
+            layer_labels        = labels[..., sl].reshape(-1)
+            layer_label_weights = label_weights[..., sl].reshape(-1)
+            layer_score         = preds_dict['heatmap'][..., sl]           # [B, C, K]
+            layer_cls_score     = layer_score.permute(0, 2, 1).reshape(-1, self.num_classes)
+
+            if layer_cls_score.numel() == 0 or layer_labels.numel() == 0:
+                layer_loss_cls = layer_cls_score.sum() * 0.0
+            else:
+                layer_loss_cls = self.loss_cls(
+                    layer_cls_score, layer_labels, layer_label_weights,
+                    avg_factor=max(num_pos, 1)
+                )
+
+            # bbox
+            layer_center = preds_dict['center'][..., sl]
+            layer_height = preds_dict['height'][..., sl]
+            layer_rot    = preds_dict['rot'][..., sl]
+            layer_dim    = preds_dict['dim'][..., sl]
+
+            preds = torch.cat([layer_center, layer_height, layer_dim, layer_rot], dim=1).permute(0, 2, 1)
+            if 'vel' in preds_dict:
+                layer_vel = preds_dict['vel'][..., sl]
+                preds = torch.cat([layer_center, layer_height, layer_dim, layer_rot, layer_vel], dim=1).permute(0, 2, 1)
+
+            code_weights       = self.train_cfg.get('code_weights', None)
+            layer_bbox_weights = bbox_weights[:, sl, :]
+            layer_reg_weights  = layer_bbox_weights * layer_bbox_weights.new_tensor(code_weights)
+            layer_bbox_targets = bbox_targets[:, sl, :]
+
             layer_loss_bbox = self.loss_bbox(preds, layer_bbox_targets, layer_reg_weights, avg_factor=max(num_pos, 1))
 
-            # layer_iou = preds_dict['iou'][..., idx_layer*self.num_proposals:(idx_layer+1)*self.num_proposals].squeeze(1)
-            # layer_iou_target = ious[..., idx_layer*self.num_proposals:(idx_layer+1)*self.num_proposals]
-            # layer_loss_iou = self.loss_iou(layer_iou, layer_iou_target, layer_bbox_weights.max(-1).values, avg_factor=max(num_pos, 1))
-
-            loss_dict[f'{prefix}_loss_cls'] = layer_loss_cls
+            loss_dict[f'{prefix}_loss_cls']  = layer_loss_cls
             loss_dict[f'{prefix}_loss_bbox'] = layer_loss_bbox
-            # loss_dict[f'{prefix}_loss_iou'] = layer_loss_iou
 
-        loss_dict[f'matched_ious'] = layer_loss_cls.new_tensor(matched_ious)
+        loss_dict['matched_ious'] = layer_loss_cls.new_tensor(matched_ious)
 
+        # -------- 4) 属性（visibility / cause）loss（仅在最后一层监督） --------
+        if self.with_aux_attr and ('vis_logits' in preds_dict) and ('cause_logits' in preds_dict):
+            # 取最后一层的 K 个 proposal（auxiliary=False 时就是唯一一层）
+            if self.auxiliary:
+                vis_logits   = preds_dict['vis_logits'][..., -self.num_proposals:].permute(0, 2, 1)   # [B, K, 4]
+                cause_logits = preds_dict['cause_logits'][..., -self.num_proposals:].permute(0, 2, 1) # [B, K, 6]
+            else:
+                vis_logits   = preds_dict['vis_logits'].permute(0, 2, 1)
+                cause_logits = preds_dict['cause_logits'].permute(0, 2, 1)
+
+            if assigned_gt_inds_full is None:
+                # 还没把“proposal→gt 索引”加到 get_targets 返回：先安全跳过
+                loss_dict['loss_vis']   = vis_logits.sum() * 0
+                loss_dict['loss_cause'] = cause_logits.sum() * 0
+            else:
+                # 只监督正样本（assigned_gt_inds_full >= 0）
+                last_slice = slice((total_layers - 1) * self.num_proposals, total_layers * self.num_proposals)
+                assigned_last = assigned_gt_inds_full[:, last_slice]  # [B, K]
+                pos_mask = assigned_last >= 0
+
+                device = vis_logits.device
+                B, K = assigned_last.shape
+                vis_tgt   = assigned_last.new_full((B, K), -1, dtype=torch.long)
+                cause_tgt = assigned_last.new_full((B, K), -1, dtype=torch.long)
+
+                for b in range(B):
+                    if pos_mask[b].any():
+                        gt_idx = assigned_last[b, pos_mask[b]]
+                        gv = torch.as_tensor(gt_vis_labels_list[b],   device=device, dtype=torch.long)
+                        gc = torch.as_tensor(gt_cause_labels_list[b], device=device, dtype=torch.long)
+                        vis_tgt[b, pos_mask[b]]   = gv[gt_idx]
+                        cause_tgt[b, pos_mask[b]] = gc[gt_idx]
+
+                keep_v = (vis_tgt >= 0)
+                keep_c = (cause_tgt >= 0)
+
+                if keep_v.any():
+                    loss_dict['loss_vis'] = self.loss_vis(vis_logits[keep_v], vis_tgt[keep_v])
+                else:
+                    loss_dict['loss_vis'] = vis_logits.sum() * 0
+                if keep_c.any():
+                    loss_dict['loss_cause'] = self.loss_cause(cause_logits[keep_c], cause_tgt[keep_c])
+                else:
+                    loss_dict['loss_cause'] = cause_logits.sum() * 0
+        # -------- 5) 记录正样本数 --------            
+        loss_dict['num_pos'] = layer_loss_cls.new_tensor(float(num_pos))
         return loss_dict
 
+    # transfusion_head.py
+    @force_fp32(apply_to=('preds_dicts',))
     def get_bboxes(self, preds_dicts, img_metas, img=None, rescale=False, for_roi=False):
         """Generate bboxes from bbox head predictions.
 
         Args:
-            preds_dicts (tuple[list[dict]]): Prediction results.
+            preds_dicts (list[list[dict]]): 
+                形状大致是 [num_layers, num_branch(=1), dict]，
+                dict 里有 heatmap/center/dim/rot/height/(vel)/vis_logits/cause_logits 等。
+            img_metas (list[dict]): 当前 batch 的 meta。
 
         Returns:
-            list[list[dict]]: Decoded bbox, scores and labels for each layer & each batch
+            list[dict]: 每张图一个 dict，键包括：
+                'boxes_3d', 'scores_3d', 'labels_3d', 'attr_vis', 'attr_cause'
         """
-        rets = []
-        for layer_id, preds_dict in enumerate(preds_dicts):
-            batch_size = preds_dict[0]['heatmap'].shape[0]
-            batch_score = preds_dict[0]['heatmap'][..., -self.num_proposals:].sigmoid()
-            # if self.loss_iou.loss_weight != 0:
-            #    batch_score = torch.sqrt(batch_score * preds_dict[0]['iou'][..., -self.num_proposals:].sigmoid())
-            one_hot = F.one_hot(self.query_labels, num_classes=self.num_classes).permute(0, 2, 1)
-            batch_score = batch_score * preds_dict[0]['query_heatmap_score'] * one_hot
+        # 只用最后一层、pts 分支
+        last_layer = preds_dicts[-1]
+        # preds_dicts 可能是：
+        #   1) list[dict]         -> last_layer 是 dict
+        #   2) tuple[list[dict]]  -> last_layer 是 list[dict]，需要取第 0 个 dict
+        if isinstance(last_layer, (list, tuple)):
+            # 这种情况每个 batch 一个 dict，这里只用第 0 个就够拿 shape 了
+            last = last_layer[0]
+        else:
+            # 这种情况本身就是 batched dict
+            last = last_layer
 
-            batch_center = preds_dict[0]['center'][..., -self.num_proposals:]
-            batch_height = preds_dict[0]['height'][..., -self.num_proposals:]
-            batch_dim = preds_dict[0]['dim'][..., -self.num_proposals:]
-            batch_rot = preds_dict[0]['rot'][..., -self.num_proposals:]
-            batch_vel = None
-            if 'vel' in preds_dict[0]:
-                batch_vel = preds_dict[0]['vel'][..., -self.num_proposals:]
+        B = last['heatmap'].shape[0]
+        # --------- 1. 截取最后 K 个 proposal，和你原来的做法一致 ---------
+        heatmap = last['heatmap'][..., -self.num_proposals:].sigmoid()
+        center  = last['center'][..., -self.num_proposals:]
+        height  = last['height'][..., -self.num_proposals:]
+        dim     = last['dim'][..., -self.num_proposals:]
+        rot     = last['rot'][..., -self.num_proposals:]
+        vel     = last['vel'][..., -self.num_proposals:] if 'vel' in last else None
 
-            temp = self.bbox_coder.decode(batch_score, batch_rot, batch_dim, batch_center, batch_height, batch_vel, filter=True)
+        # --------- 2. decode box（原来就有的逻辑） ---------
+        decoded = self.bbox_coder.decode(
+            heatmap, rot, dim, center, height, vel, filter=True
+        )
+        # decoded[b] 是 dict，至少有 'bboxes' / 'scores' / 'labels'
 
-            if self.test_cfg['dataset'] == 'nuScenes':
-                self.tasks = [
-                    dict(num_class=8, class_names=[], indices=[0, 1, 2, 3, 4, 5, 6, 7], radius=-1),
-                    dict(num_class=1, class_names=['pedestrian'], indices=[8], radius=0.175),
-                    dict(num_class=1, class_names=['traffic_cone'], indices=[9], radius=0.175),
-                ]
-            elif self.test_cfg['dataset'] == 'Waymo':
-                self.tasks = [
-                    dict(num_class=1, class_names=['Car'], indices=[0], radius=0.7),
-                    dict(num_class=1, class_names=['Pedestrian'], indices=[1], radius=0.7),
-                    dict(num_class=1, class_names=['Cyclist'], indices=[2], radius=0.7),
-                ]
+        # --------- 3. 处理 attr（vis / cause）---------
+        vis_pred   = None  # [B, K]
+        cause_pred = None  # [B, K]
 
-            ret_layer = []
-            for i in range(batch_size):
-                boxes3d = temp[i]['bboxes']
-                scores = temp[i]['scores']
-                labels = temp[i]['labels']
-                ## adopt circle nms for different categories
-                if self.test_cfg['nms_type'] != None:
-                    keep_mask = torch.zeros_like(scores)
-                    for task in self.tasks:
-                        task_mask = torch.zeros_like(scores)
-                        for cls_idx in task['indices']:
-                            task_mask += labels == cls_idx
-                        task_mask = task_mask.bool()
-                        if task['radius'] > 0:
-                            if self.test_cfg['nms_type'] == 'circle':
-                                boxes_for_nms = torch.cat([boxes3d[task_mask][:, :2], scores[:, None][task_mask]], dim=1)
-                                task_keep_indices = torch.tensor(
-                                    circle_nms(
-                                        boxes_for_nms.detach().cpu().numpy(),
-                                        task['radius'],
-                                    )
-                                )
-                            else:
-                                boxes_for_nms = xywhr2xyxyr(img_metas[i]['box_type_3d'](boxes3d[task_mask][:, :7], 7).bev)
-                                top_scores = scores[task_mask]
-                                task_keep_indices = nms_gpu(
-                                    boxes_for_nms,
-                                    top_scores,
-                                    thresh=task['radius'],
-                                    pre_maxsize=self.test_cfg['pre_maxsize'],
-                                    post_max_size=self.test_cfg['post_maxsize'],
-                                )
-                        else:
-                            task_keep_indices = torch.arange(task_mask.sum())
-                        if task_keep_indices.shape[0] != 0:
-                            keep_indices = torch.where(task_mask != 0)[0][task_keep_indices]
-                            keep_mask[keep_indices] = 1
-                    keep_mask = keep_mask.bool()
-                    ret = dict(bboxes=boxes3d[keep_mask], scores=scores[keep_mask], labels=labels[keep_mask])
-                else:  # no nms
-                    ret = dict(bboxes=boxes3d, scores=scores, labels=labels)
-                ret_layer.append(ret)
-            rets.append(ret_layer)
-        #m len print
-        print(f"rets shape: {len(rets)}, rets[0] shape: {len(rets[0])}")
-        assert len(rets) == 1
-        assert len(rets[0]) == 1
-        res = [[
-            img_metas[0]['box_type_3d'](rets[0][0]['bboxes'], box_dim=rets[0][0]['bboxes'].shape[-1]),
-            rets[0][0]['scores'],
-            rets[0][0]['labels'].int()
-        ]]
-        return res
+        if self.with_aux_attr:
+            if 'vis_logits' in last:
+                # vis_logits: [B, num_vis_cls, num_proposals]
+                vis_logits = last['vis_logits'][..., -self.num_proposals:]
+                # 你如果做 loss 时用的是 CrossEntropyLoss，这里就直接 argmax 即可
+                vis_pred = vis_logits.argmax(dim=1)  # [B, K]
+
+            if 'cause_logits' in last:
+                cause_logits = last['cause_logits'][..., -self.num_proposals:]
+                cause_pred = cause_logits.argmax(dim=1)  # [B, K]
+        # 统一 img_metas 形态：不管传进来是 dict 还是 list/tuple，最后都变成 list[dict]
+        if isinstance(img_metas, dict):
+            meta_list = [img_metas]
+        elif isinstance(img_metas, (list, tuple)):
+            # 有时候会是 list[list[dict]]（多相机），有时候是 list[dict]（单相机）
+            # 我们只关心“batch 维度”，多相机的情况你原本的代码是拿 meta['box_type_3d']，
+            # 不区分相机，所以这里不需要展开更深一层。
+            meta_list = list(img_metas)
+        else:
+            raise TypeError(f'img_metas must be dict or list/tuple of dict, but got {type(img_metas)}')
+        # --------- 4. 对每张图构造输出结构 ---------
+        bbox_list = []
+        for b in range(B):
+            boxes3d = decoded[b]['bboxes']   # Tensor [N, box_dim]
+            scores  = decoded[b]['scores']   # [N]
+            labels  = decoded[b]['labels']   # [N]
+
+            # 转成 box_type_3d 对象（你之前就是这么做的）
+            # 这里用前面统一好的 meta_list，兼容 dict / list 两种情况
+            if b < len(meta_list):
+                meta = meta_list[b]
+            else:
+                # 极端情况下如果 batch_size > len(meta_list)，就复用最后一个 meta
+                meta = meta_list[-1]
+            box_type_3d = meta['box_type_3d']
+            boxes_3d_obj = box_type_3d(boxes3d, box_dim=boxes3d.shape[-1])
+
+            # attr 也截到 N（一般 N == K，如果 bbox_coder 里有 filter，N 可能小于 K）
+            attr_vis_b   = None
+            attr_cause_b = None
+            if vis_pred is not None:
+                attr_vis_b = vis_pred[b][: boxes3d.size(0)]   # [N]
+            if cause_pred is not None:
+                attr_cause_b = cause_pred[b][: boxes3d.size(0)]  # [N]
+
+            bbox_list.append(dict(
+                boxes_3d   = boxes_3d_obj,
+                scores_3d  = scores,
+                labels_3d  = labels.int(),
+                attr_vis   = attr_vis_b,     # 可能为 None
+                attr_cause = attr_cause_b,   # 可能为 None
+            ))
+
+        return bbox_list

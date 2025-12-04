@@ -21,26 +21,37 @@ def _draw_points(points,
     Args:
         points (numpy.array | torch.tensor, shape=[N, 3+C]):
             points to visualize.
-        vis (:obj:`open3d.visualization.Visualizer`): open3d visualizer.
+        vis (:obj:`open3d.visualization.Visualizer` or None): open3d visualizer.
         points_size (int): the size of points to show on visualizer.
             Default: 2.
         point_color (tuple[float]): the color of points.
             Default: (0.5, 0.5, 0.5).
-        mode (str):  indicate type of the input points, avaliable mode
+        mode (str):  indicate type of the input points, available mode
             ['xyz', 'xyzrgb']. Default: 'xyz'.
 
     Returns:
-        tuple: points, color of each point.
+        tuple: (pcd, points_colors)
     """
-    vis.get_render_option().point_size = points_size  # set points size
+    # ⚠️ headless 环境下 vis 或 render_option 可能拿不到，这里做防护
+    if vis is not None:
+        try:
+            opt = vis.get_render_option()
+            if opt is not None:
+                opt.point_size = points_size  # set points size
+        except Exception:
+            # get_render_option 失败就直接跳过，不影响后面构造 pcd
+            pass
+
     if isinstance(points, torch.Tensor):
         points = points.cpu().numpy()
 
     points = points.copy()
     pcd = geometry.PointCloud()
+
     if mode == 'xyz':
         pcd.points = o3d.utility.Vector3dVector(points[:, :3])
-        points_colors = np.tile(np.array(point_color), (points.shape[0], 1))
+        points_colors = np.tile(np.array(point_color, dtype=np.float32),
+                                (points.shape[0], 1))
     elif mode == 'xyzrgb':
         pcd.points = o3d.utility.Vector3dVector(points[:, :3])
         points_colors = points[:, 3:6]
@@ -48,9 +59,16 @@ def _draw_points(points,
         raise NotImplementedError
 
     pcd.colors = o3d.utility.Vector3dVector(points_colors)
-    vis.add_geometry(pcd)
+
+    if vis is not None:
+        try:
+            vis.add_geometry(pcd)
+        except Exception:
+            # headless 下 add_geometry 也可能失败，直接忽略
+            pass
 
     return pcd, points_colors
+
 
 
 def _draw_bboxes(bbox3d,

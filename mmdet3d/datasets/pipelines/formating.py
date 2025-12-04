@@ -47,7 +47,23 @@ class DefaultFormatBundle(object):
                 imgs = np.ascontiguousarray(np.stack(imgs, axis=0))
                 results['img'] = DC(to_tensor(imgs), stack=True)
             else:
-                img = np.ascontiguousarray(results['img'].transpose(2, 0, 1))
+                img = results['img']
+
+                # 兼容灰度图等 2D 情况
+                if img.ndim == 2:
+                    img = np.expand_dims(img, -1)   # (H,W) -> (H,W,1)
+
+                if img.ndim == 3:
+                    # 单视角: (H, W, C) -> (C, H, W)
+                    img = np.ascontiguousarray(img.transpose(2, 0, 1))
+                elif img.ndim == 4:
+                    # 多视角: (N, H, W, C) -> (N, C, H, W)
+                    img = np.ascontiguousarray(img.transpose(0, 3, 1, 2))
+                else:
+                    raise ValueError(
+                        f'Unsupported img ndim {img.ndim} in DefaultFormatBundle'
+                    )
+
                 results['img'] = DC(to_tensor(img), stack=True)
         for key in [
                 'proposals', 'gt_bboxes', 'gt_bboxes_ignore', 'gt_labels',
@@ -260,3 +276,13 @@ class DefaultFormatBundle3D(DefaultFormatBundle):
         repr_str += 'with_gt={}, with_label={})'.format(
             self.with_gt, self.with_label)
         return repr_str
+    
+@PIPELINES.register_module()
+class PackAttrForCollate(object):
+    """Wrap attr fields to DataContainer so DDP won't try to move numpy to GPU."""
+    def __call__(self, results):
+        for k in ['gt_vis_labels', 'gt_cause_labels']:
+            if k in results and results[k] is not None:
+                # 关键：cpu_only=True，且不堆叠
+                results[k] = DC(results[k], cpu_only=True, stack=False)
+        return results

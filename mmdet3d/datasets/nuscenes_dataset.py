@@ -4,12 +4,94 @@ import pyquaternion
 import tempfile
 from nuscenes.utils.data_classes import Box as NuScenesBox
 from os import path as osp
-
+import torch
 from mmdet.datasets import DATASETS
 from ..core import show_result
 from ..core.bbox import Box3DMode, Coord3DMode, LiDARInstance3DBoxes
 from .custom_3d import Custom3DDataset
+def _match_by_center(pred_xy, gt_xy, dist_thr):
+    """贪心匹配：按预测顺序，与最近 GT 匹配且距离<=阈值；返回 tp、fp 和匹配对索引。
+    pred_xy: (P,2) torch
+    gt_xy:   (G,2) torch
+    """
+    device = pred_xy.device
+    gt_xy = gt_xy.to(device)
 
+    P = pred_xy.shape[0]
+    G = gt_xy.shape[0]
+
+    if P == 0:
+        return (
+            torch.zeros(0, dtype=torch.float32, device=device),
+            torch.zeros(0, dtype=torch.float32, device=device),
+            []
+        )
+    if G == 0:
+        return (
+            torch.zeros(P, dtype=torch.float32, device=device),
+            torch.ones(P, dtype=torch.float32, device=device),
+            []
+        )
+
+    used = torch.zeros(G, dtype=torch.bool, device=pred_xy.device)
+    tp = torch.zeros(P, dtype=torch.float32, device=pred_xy.device)
+    fp = torch.zeros(P, dtype=torch.float32, device=pred_xy.device)
+    matches = []
+    for i in range(P):
+        d = torch.norm(pred_xy[i][None, :] - gt_xy, dim=1)  # (G,)
+        minv, j = torch.min(d, dim=0)
+        if (minv.item() <= dist_thr) and (not used[j]):
+            tp[i] = 1.0
+            used[j] = True
+            matches.append((i, int(j.item())))
+        else:
+            fp[i] = 1.0
+    return tp, fp, matches
+
+def _voc_ap(rec, prec):
+    """11-point 风格的 AP 近似；rec/prec 为 numpy 数组。"""
+    mrec = np.concatenate(([0.], rec, [1.]))
+    mpre = np.concatenate(([0.], prec, [0.]))
+    for i in range(mpre.size - 1, 0, -1):
+        mpre[i - 1] = max(mpre[i - 1], mpre[i])
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+    ap = np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
+    return float(ap)
+
+def _axis_aligned_iou_3d_np(box1, box2):
+    """用轴对齐包围盒计算 3D IoU（忽略朝向 yaw）
+
+    box: [x, y, z, dx, dy, dz, (yaw...)]
+    这里假设框的尺寸是以中心为原点的 dx, dy, dz
+    """
+    x1, y1, z1, dx1, dy1, dz1 = box1[:6]
+    x2, y2, z2, dx2, dy2, dz2 = box2[:6]
+
+    # 还原成 [min, max]
+    x1_min, x1_max = x1 - dx1 * 0.5, x1 + dx1 * 0.5
+    y1_min, y1_max = y1 - dy1 * 0.5, y1 + dy1 * 0.5
+    z1_min, z1_max = z1 - dz1 * 0.5, z1 + dz1 * 0.5
+
+    x2_min, x2_max = x2 - dx2 * 0.5, x2 + dx2 * 0.5
+    y2_min, y2_max = y2 - dy2 * 0.5, y2 + dy2 * 0.5
+    z2_min, z2_max = z2 - dz2 * 0.5, z2 + dz2 * 0.5
+
+    inter_dx = max(0.0, min(x1_max, x2_max) - max(x1_min, x2_min))
+    inter_dy = max(0.0, min(y1_max, y2_max) - max(y1_min, y2_min))
+    inter_dz = max(0.0, min(z1_max, z2_max) - max(z1_min, z2_min))
+    inter_vol = inter_dx * inter_dy * inter_dz
+
+    vol1 = (x1_max - x1_min) * (y1_max - y1_min) * (z1_max - z1_min)
+    vol2 = (x2_max - x2_min) * (y2_max - y2_min) * (z2_max - z2_min)
+
+    if vol1 <= 0.0 or vol2 <= 0.0:
+        return 0.0
+
+    union = vol1 + vol2 - inter_vol
+    if union <= 0.0:
+        return 0.0
+
+    return float(inter_vol / (union + 1e-7))
 
 @DATASETS.register_module()
 class NuScenesDataset(Custom3DDataset):
@@ -97,9 +179,7 @@ class NuScenesDataset(Custom3DDataset):
         'vehicle.parked',
         'vehicle.stopped',
     ]
-    CLASSES = ('car', 'truck', 'trailer', 'bus', 'construction_vehicle',
-               'bicycle', 'motorcycle', 'pedestrian', 'traffic_cone',
-               'barrier')
+    CLASSES = ('grape','leaf','stem','vine')
 
     def __init__(self,
                  ann_file,
@@ -133,6 +213,16 @@ class NuScenesDataset(Custom3DDataset):
         self.eval_version = eval_version
         from nuscenes.eval.detection.config import config_factory
         self.eval_detection_configs = config_factory(self.eval_version)
+        # —— 兼容自定义类：若评测配置没有你的类，就给个无限范围，避免 KeyError 与误过滤
+        try:
+            cr = self.eval_detection_configs.class_range
+        except Exception:
+            cr = {}
+            self.eval_detection_configs.class_range = cr
+
+        for cname in self.CLASSES:
+            cr.setdefault(cname, float('inf'))
+            
         if self.modality is None:
             self.modality = dict(
                 use_camera=False,
@@ -216,6 +306,8 @@ class NuScenesDataset(Custom3DDataset):
             lidar2img_rts = []
             # for cam_type, cam_info in info['cams'].items():
             for cam_type in cam_orders:
+                if cam_type not in info['cams']:
+                    continue
                 cam_info = info['cams'][cam_type]
                 image_paths.append(cam_info['data_path'])
                 # obtain lidar to image transformation matrix
@@ -285,11 +377,31 @@ class NuScenesDataset(Custom3DDataset):
             gt_bboxes_3d,
             box_dim=gt_bboxes_3d.shape[-1],
             origin=(0.5, 0.5, 0.5)).convert_to(self.box_mode_3d)
+        ################加入visibility和cause属性预测##################
+        # 取原始字段（可能不存在）
+        gt_vis = info.get('gt_vis_labels', None)
+        gt_cause = info.get('gt_cause_labels', None)
+
+        # 先按 mask 过滤
+        if gt_vis is not None:
+            gt_vis = gt_vis[mask]
+        if gt_cause is not None:
+            gt_cause = gt_cause[mask]
+
+        # —— 关键：保证始终有这两个键，并与 gt 个数对齐 ——
+        n = len(gt_labels_3d)
+        if gt_vis is None:
+            gt_vis = np.full((n,), -1, dtype=np.int64)         # -1 表示忽略监督
+        if gt_cause is None:
+            gt_cause = np.full((n,), -1, dtype=np.int64)
 
         anns_results = dict(
             gt_bboxes_3d=gt_bboxes_3d,
             gt_labels_3d=gt_labels_3d,
-            gt_names=gt_names_3d)
+            gt_names=gt_names_3d,
+            gt_vis_labels=gt_vis,           # 无论如何都带上
+            gt_cause_labels=gt_cause,
+        )
         return anns_results
 
     def _format_bbox(self, results, jsonfile_prefix=None):
@@ -451,51 +563,225 @@ class NuScenesDataset(Custom3DDataset):
                 result_files.update(
                     {name: self._format_bbox(results_, tmp_file_)})
         return result_files, tmp_dir
-
+    
     def evaluate(self,
-                 results,
-                 metric='bbox',
-                 logger=None,
-                 jsonfile_prefix=None,
-                 result_names=['pts_bbox'],
-                 show=False,
-                 out_dir=None):
-        """Evaluation in nuScenes protocol.
-
-        Args:
-            results (list[dict]): Testing results of the dataset.
-            metric (str | list[str]): Metrics to be evaluated.
-            logger (logging.Logger | str | None): Logger used for printing
-                related information during evaluation. Default: None.
-            jsonfile_prefix (str | None): The prefix of json files. It includes
-                the file path and the prefix of filename, e.g., "a/b/prefix".
-                If not specified, a temp file will be created. Default: None.
-            show (bool): Whether to visualize.
-                Default: False.
-            out_dir (str): Path to save the visualization results.
-                Default: None.
-
-        Returns:
-            dict[str, float]: Results of each evaluation metric.
+                results,
+                metric='bbox',
+                logger=None,
+                jsonfile_prefix=None,
+                result_names=['pts_bbox'],
+                show=False,
+                out_dir=None):
+        """自定义评测：支持4类 grapes 数据集；默认用中心距离匹配算 mAP，
+        并在可用时计算 vis/cause 属性准确率。
+        - results: 来自 simple_test 的列表，每个元素是 {'pts_bbox': {...}}。
+        - 我们直接用 results 和 GT 做评测，不再调用 NuScenes 官方评测器。
         """
-        result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
+        from collections import defaultdict
+        import torch
+        all_matchious = []
+        assert isinstance(results, list) and len(results) == len(self), \
+            f'Expect len(results)==len(dataset), got {len(results)} vs {len(self)}'
 
-        if isinstance(result_files, dict):
-            results_dict = dict()
-            for name in result_names:
-                print('Evaluating bboxes of {}'.format(name))
-                ret_dict = self._evaluate_single(result_files[name])
-            results_dict.update(ret_dict)
-        elif isinstance(result_files, str):
-            results_dict = self._evaluate_single(result_files)
+        # 评测参数（可在 cfg.data.val/eval_params 里通过 dataset 初始化传入）
+        eval_params = getattr(self, 'eval_params', {})
+        # 中心距离阈值（米），用于 TP/FP 匹配；你也可以设不同类不同阈值
+        dist_thr = float(eval_params.get('center_dist_thr', 0.05))  # 默认 5cm
+        # AP 计算时的分阈值（给你常用两档，后续可以拓展更多）
+        ap_thrs = eval_params.get('ap_thrs', [0.25, 0.5])  # 名义占位；中心匹配时我们只会算一档
+        # 匹配模式：'center'（默认）、'bev_iou'、'iou_3d'
+        match_mode = eval_params.get('match_mode', 'center')
 
-        if tmp_dir is not None:
-            tmp_dir.cleanup()
+        # 统计结构
+        cls2scores = {c: [] for c in self.CLASSES}
+        cls2tp = {c: [] for c in self.CLASSES}
+        cls2fp = {c: [] for c in self.CLASSES}
+        cls2gt = {c: 0 for c in self.CLASSES}
+
+        # 属性统计（可选）
+        do_attr = True
+        attr_hit = {'vis': 0, 'cause': 0}
+        attr_tot = {'vis': 0, 'cause': 0}
+        # 属性统计（只在有匹配对、且 pred/gt 都带该属性时计数）
+        # if do_attr and len(matches) > 0 and attrs_pred is not None:
+        #     m_pred_mask = pred_mask.nonzero(as_tuple=False).squeeze(1)[sel_inds]
+        #     m_gt_idx = gt_mask.nonzero(as_tuple=False).squeeze(1)
+
+        #     # vis
+        #     if ('vis' in attrs_pred) and (gt_vis is not None):
+        #         for p_idx, g_local in matches:
+        #             g_idx = m_gt_idx[g_local]
+        #             # 只统计 grape/stem（假设其它类的 gt_vis 设为 -1）
+        #             if int(gt_vis[g_idx]) < 0:
+        #                 continue
+        #             p_idx_global = m_pred_mask[p_idx]
+        #             if int(attrs_pred['vis'][p_idx_global]) == int(gt_vis[g_idx]):
+        #                 attr_hit['vis'] += 1
+        #             attr_tot['vis'] += 1
+
+        #     # cause
+        #     if ('cause' in attrs_pred) and (gt_cause is not None):
+        #         for p_idx, g_local in matches:
+        #             g_idx = m_gt_idx[g_local]
+        #             if int(gt_cause[g_idx]) < 0:
+        #                 continue
+        #             p_idx_global = m_pred_mask[p_idx]
+        #             if int(attrs_pred['cause'][p_idx_global]) == int(gt_cause[g_idx]):
+        #                 attr_hit['cause'] += 1
+        #             attr_tot['cause'] += 1
+        # 遍历每一帧
+        for idx, out in enumerate(results):
+            if 'pts_bbox' not in out:
+                raise KeyError(f"Missing key 'pts_bbox' in results[{idx}]. "
+                            f"simple_test 应返回形如 {{'pts_bbox': {{boxes_3d, scores_3d, labels_3d, attrs?}}}} 的结构。")
+            pred = out['pts_bbox']
+            boxes_pred = pred['boxes_3d']     # LiDARInstance3DBoxes
+            scores_pred = pred['scores_3d']   # (N,)
+            labels_pred = pred['labels_3d']   # (N,)
+            attrs_pred = pred.get('attrs', None)  # 可选: {'vis': LongTensor[N], 'cause': LongTensor[N]}
+
+            ann = self.get_ann_info(idx)
+            boxes_gt = ann['gt_bboxes_3d']    # LiDARInstance3DBoxes
+            labels_gt = ann['gt_labels_3d']   # (M,)
+            # 可选 GT 属性（若你在 ann_info 里已塞了）
+            gt_vis = ann.get('gt_vis_labels', None)          # LongTensor[M]
+            gt_cause = ann.get('gt_cause_labels', None)      # LongTensor[M]
+
+            # 逐类评测
+            for cid, cname in enumerate(self.CLASSES):
+                # 取该类 GT
+                gt_mask = (labels_gt == cid)
+                num_gt = int(gt_mask.sum().item()) if hasattr(gt_mask, 'sum') else int(gt_mask.sum())
+                cls2gt[cname] += num_gt
+
+                # 取该类预测
+                pred_mask = (labels_pred == cid)
+                if hasattr(pred_mask, 'sum') and int(pred_mask.sum()) == 0:
+                    continue
+
+                # 筛选并按分数降序
+                if hasattr(scores_pred, 'device'):
+                    device = scores_pred.device
+                else:
+                    device = None
+                sel_scores = scores_pred[pred_mask]
+                sel_inds = torch.argsort(sel_scores, descending=True)
+                sel_scores = sel_scores[sel_inds]
+
+                sel_boxes = boxes_pred.tensor[pred_mask][sel_inds]  # (P, 7)
+                # 注意：boxes_gt.tensor 是 (M, 7)
+                gt_boxes_t = boxes_gt.tensor[gt_mask] if num_gt > 0 else boxes_gt.tensor.new_zeros((0, 7))
+
+                # 匹配
+                if match_mode == 'center':
+                    # 2D 中心距离（XY）——稳妥且不依赖 CUDA 自定义算子
+                    if sel_boxes.shape[0] == 0:
+                        tp = torch.zeros(0, dtype=torch.float32, device=device)
+                        fp = torch.zeros(0, dtype=torch.float32, device=device)
+                        matches = []
+                    else:
+                        tp, fp, matches = _match_by_center(sel_boxes[:, :2], gt_boxes_t[:, :2], dist_thr)
+                else:
+                    # 你后面想切换 BEV IoU / 3D IoU 时，我们再接入相应的 overlaps 函数
+                    # 这里先退回 center 匹配，避免环境依赖问题
+                    tp, fp, matches = _match_by_center(sel_boxes[:, :2], gt_boxes_t[:, :2], dist_thr)
+                    
+                        # === 额外统计：真正的 3D IoU（轴对齐） ===
+                # matches 里保存的是 (pred_idx_local, gt_idx_local)，只包含 TP
+                if len(matches) > 0:
+                    # sel_boxes / gt_boxes_t 可能是 Tensor 也可能是 Boxes，统一转成 numpy
+                    if hasattr(sel_boxes, 'tensor'):
+                        sel_np = sel_boxes.tensor.detach().cpu().numpy()
+                    else:
+                        sel_np = sel_boxes.detach().cpu().numpy()
+
+                    if hasattr(gt_boxes_t, 'tensor'):
+                        gt_np = gt_boxes_t.tensor.detach().cpu().numpy()
+                    else:
+                        gt_np = gt_boxes_t.detach().cpu().numpy()
+
+                    iou_list = []
+                    for p_local, g_local in matches:
+                        iou = _axis_aligned_iou_3d_np(sel_np[p_local], gt_np[g_local])
+                        iou_list.append(iou)
+
+                    if len(iou_list) > 0:
+                        all_matchious.append(np.array(iou_list, dtype=np.float32))
+
+
+                # 累加 PR 明细（注意每帧要衔接 cumulate，所以只存 per-detection 的 tp/fp 与分数）
+                cls2scores[cname].append(sel_scores.detach().cpu())
+                cls2tp[cname].append(tp.detach().cpu())
+                cls2fp[cname].append(fp.detach().cpu())
+
+                # 属性统计（只在有匹配对、且 pred/gt 都带该属性时计数）
+                if do_attr and len(matches) > 0 and attrs_pred is not None:
+                    m_pred_mask = pred_mask.nonzero().squeeze(1)[sel_inds]  # 映射回原 preds 索引
+                    # gt_mask 是 numpy.bool_ 数组，用 numpy 的 nonzero
+                    m_gt_idx = np.nonzero(gt_mask)[0]                 # 映射回原 gt 索引
+                    # vis
+                    if ('vis' in attrs_pred) and (gt_vis is not None):
+                        for p_idx, g_local in matches:
+                            g_idx = m_gt_idx[g_local]
+                            p_idx_global = m_pred_mask[p_idx]
+                            if int(attrs_pred['vis'][p_idx_global]) == int(gt_vis[g_idx]):
+                                attr_hit['vis'] += 1
+                            attr_tot['vis'] += 1
+                    # cause
+                    if ('cause' in attrs_pred) and (gt_cause is not None):
+                        for p_idx, g_local in matches:
+                            g_idx = m_gt_idx[g_local]
+                            p_idx_global = m_pred_mask[p_idx]
+                            if int(attrs_pred['cause'][p_idx_global]) == int(gt_cause[g_idx]):
+                                attr_hit['cause'] += 1
+                            attr_tot['cause'] += 1
+        
+        # 汇总：拼接各帧的 tp/fp/scores，按分数降序累加，算 AP
+        results_dict = {}
+        aps = []
+        for cname in self.CLASSES:
+            print(f"{cname}: gt = {cls2gt[cname]}, num_det_frames = {len(cls2scores[cname])}")
+            if len(cls2scores[cname]) == 0:
+                results_dict[f'AP_{cname}'] = 0.0
+                continue
+            scores = torch.cat(cls2scores[cname], dim=0)
+            tp = torch.cat(cls2tp[cname], dim=0)
+            fp = torch.cat(cls2fp[cname], dim=0)
+
+            order = torch.argsort(scores, descending=True)
+            tp = tp[order]
+            fp = fp[order]
+
+            cum_tp = torch.cumsum(tp, dim=0)
+            cum_fp = torch.cumsum(fp, dim=0)
+            denom = torch.clamp(cum_tp + cum_fp, min=1)
+            prec = (cum_tp / denom).numpy()
+            rec = (cum_tp / max(cls2gt[cname], 1)).numpy()
+            ap = _voc_ap(rec, prec)
+            results_dict[f'AP_{cname}'] = float(ap)
+            aps.append(ap)
+
+        results_dict['mAP'] = float(sum(aps) / max(len(aps), 1))
+
+        # 属性指标（若两边都有就给，否则跳过）
+        if attr_tot['vis'] > 0:
+            results_dict['acc_vis'] = attr_hit['vis'] / max(attr_tot['vis'], 1)
+        if attr_tot['cause'] > 0:
+            results_dict['acc_cause'] = attr_hit['cause'] / max(attr_tot['cause'], 1)
 
         if show:
             self.show(results, out_dir)
+            # === 汇总全局 matchious mean / max ===
+        if len(all_matchious) > 0:
+            concat_vals = np.concatenate(all_matchious, axis=0)  # 所有 TP 匹配对
+            results_dict['matchious_mean'] = float(concat_vals.mean())
+            results_dict['matchious_max']  = float(concat_vals.max())
+        else:
+            results_dict['matchious_mean'] = 0.0
+            results_dict['matchious_max']  = 0.0
         return results_dict
 
+    
     def show(self, results, out_dir):
         """Results visualization.
 
@@ -591,9 +877,13 @@ def lidar_nusc_box_to_global(info,
         box.rotate(pyquaternion.Quaternion(info['lidar2ego_rotation']))
         box.translate(np.array(info['lidar2ego_translation']))
         # filter det in ego.
-        cls_range_map = eval_configs.class_range
+        
+        # cls_range_map = eval_configs.class_range
+        # radius = np.linalg.norm(box.center[:2], 2)
+        # det_range = cls_range_map[classes[box.label]]
+        cls_range_map = getattr(eval_configs, 'class_range', {})
         radius = np.linalg.norm(box.center[:2], 2)
-        det_range = cls_range_map[classes[box.label]]
+        det_range = cls_range_map.get(classes[box.label], float('inf'))
         if radius > det_range:
             continue
         # Move box to global coord system
